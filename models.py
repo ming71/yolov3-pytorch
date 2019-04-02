@@ -281,7 +281,7 @@ class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
     def __init__(self, cfg_path, img_size=416): #类传入两个参数初始化：cfg_path和img_size
-        super(Darknet, self).__init__()         #pytorch提供的一个基类，搭建网络一般要继承这个类可以简化网络搭建过程
+        super(Darknet, self).__init__()         #继承父类的构造函数，继承自nn.Module可以直接不传递参数，如果是高阶类需要根据具体情况而定传递参数
         #注意：module_defs是一个嵌套的列表,外层列表内层嵌套的是字典
         self.module_defs = parse_model_cfg(cfg_path)    #parse_model_config()返回模型的参数信息，见notebook
         self.module_defs[0]['cfg'] = cfg_path
