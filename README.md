@@ -1,3 +1,9 @@
+# GIoU
+
+## Motivation
+
+### 角点xy和宽高中心点两种方法计算loss并不能很好地反映真实IoU
+
 # yolov3-pytorch-annotation
 **annotation** and **specification** for yolov3   
 **attention**:Inputs should be labeld the same as COCO (yolo format):normalized && cxywh  
