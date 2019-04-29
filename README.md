@@ -16,6 +16,6 @@ run   ```python train.py```    <br>
 test on the same image to verify it feasibility.   <br>
 
  This is my loss curls with testing on single picture for 100 epochs,it does converge well.    <br>
- Run `train-vis.py` to monitor loss.   <br>
+ Run `train-vis.py` to monitor loss.   </br>
  
 ![Image text](https://github.com/ming71/yolov3-pytorch-annotation/blob/master/notebook/loss.png) 
