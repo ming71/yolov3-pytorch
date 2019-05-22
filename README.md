@@ -1,6 +1,6 @@
-# yolov3-pytorch-annotation<br>
-**annotation** and **specification** for yolov3 <br>  
-**attention**:Inputs should be labeld the same as COCO (yolo format):normalized && cxywh  <br>
+# yolov3-pytorch<br>
+**Annotation** and **Specification** for yolov3 <br>  
+**Attention**:Inputs should be labeld the same as COCO (yolo format):normalized && cxywh  <br>
 
 refer to:https://github.com/ultralytics/yolov3     <br>
 
