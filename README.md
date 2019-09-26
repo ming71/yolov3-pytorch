@@ -1,3 +1,6 @@
+# Update
+This repo will be updated to recent version refer to offical code **in a week**.
+
 # yolov3-pytorch<br>
 **Annotation** and **Specification** for yolov3 <br>  
 **Attention**:Inputs should be labeld the same as COCO (yolo format):normalized && cxywh  <br>
