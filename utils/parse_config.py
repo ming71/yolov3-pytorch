@@ -1,51 +1,45 @@
-#(re)
-#解析yolov3.cfg配置，返回结果为所有的网络参数信息，见notebook的演示
+import numpy as np
+
+
+# cfg解析函数：
+#   将cfg的layer，setting等解析成dict的形式，返回一个包含这些dict的list；
+#   lsit的每个元素（dict）对应cfg文件的一个 [] 开头的block（如net等），第一个元素就是该block的性质如{'type': 'net'...}
 def parse_model_cfg(path):
-    """Parses the yolo-v3 layer configuration file and returns module definitions"""
+    # Parses the yolo-v3 layer configuration file and returns module definitions
     file = open(path, 'r')
-    lines = file.read().split('\n')     #获取所有行内容，存入列表，一行一个索引
-    lines = [x for x in lines if x and not x.startswith('#')]   #提取开头不是‘#’的行，重新存入lines列表
-    lines = [x.rstrip().lstrip() for x in lines]  #截掉每个切片的左右空格
-    module_defs = []
+    lines = file.read().split('\n')
+    lines = [x for x in lines if x and not x.startswith('#')]
+    lines = [x.rstrip().lstrip() for x in lines]  # get rid of fringe whitespaces
+    mdefs = []  # module definitions
     for line in lines:
-        if line.startswith('['):  # This marks the start of a new block[]代表是一个不同的模块
-            module_defs.append({})
-            module_defs[-1]['type'] = line[1:-1].rstrip()
-            if module_defs[-1]['type'] == 'convolutional':
-                module_defs[-1]['batch_normalize'] = 0
+        if line.startswith('['):  # This marks the start of a new block
+            mdefs.append({})
+            mdefs[-1]['type'] = line[1:-1].rstrip()
+            if mdefs[-1]['type'] == 'convolutional':
+                mdefs[-1]['batch_normalize'] = 0  # pre-populate with zeros (may be overwritten later)
         else:
-            key, value = line.split("=")
-            value = value.strip()
-            module_defs[-1][key.rstrip()] = value.strip()
+            key, val = line.split("=")
+            key = key.rstrip()
 
-    return module_defs
-# 定义了6种不同type
-# 'net': 相当于超参数,网络全局配置的相关参数
-# {'convolutional', 'net', 'route', 'shortcut', 'upsample', 'yolo'}
+            if 'anchors' in key:
+                mdefs[-1][key] = np.array([float(x) for x in val.split(',')]).reshape((-1, 2))  # np anchors
+            else:
+                mdefs[-1][key] = val.strip()
 
+    return mdefs
 
-
-
+# 像mmdetection一样，将配置文件转码return成dict的键值对形式，便于索引查询
 def parse_data_cfg(path):
-    """Parses the data configuration file"""
+    # Parses the data configuration file
     options = dict()
-    options['gpus'] = '0,1,2,3'
-    options['num_workers'] = '10'
     with open(path, 'r') as fp:
         lines = fp.readlines()
+
     for line in lines:
         line = line.strip()
         if line == '' or line.startswith('#'):
             continue
-        key, value = line.split('=')
-        options[key.strip()] = value.strip()
+        key, val = line.split('=')
+        options[key.strip()] = val.strip()
+
     return options
-    
-# {'gpus': '0,1,2,3',
-#  'num_workers': '10',
-#  'classes': '80',
-#  'train': '../coco/trainvalno5k.txt',
-#  'valid': '../coco/5k.txt',
-#  'names': 'data/coco.names',
-#  'backup': 'backup/',
-#  'eval': 'coco'}

@@ -2,70 +2,150 @@ import glob
 import math
 import os
 import random
+import shutil
+import time
+from pathlib import Path
+from threading import Thread
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image, ExifTags
+from torch.utils.data import Dataset
+from tqdm import tqdm
 
-# from torch.utils.data import Dataset
-from utils.utils import xyxy2xywh
+from utils.utils import xyxy2xywh, xywh2xyxy
+
+# 支持的图片和视频类型
+img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif'] 
+vid_formats = ['.mov', '.avi', '.mp4']
+
+# Get orientation exif tag
+for orientation in ExifTags.TAGS.keys():
+    if ExifTags.TAGS[orientation] == 'Orientation':
+        break
 
 
+def exif_size(img):
+    # Returns exif-corrected PIL size
+    s = img.size  # (width, height)
+    try:
+        rotation = dict(img._getexif().items())[orientation]
+        if rotation == 6:  # rotation 270
+            s = (s[1], s[0])
+        elif rotation == 8:  # rotation 90
+            s = (s[1], s[0])
+    except:
+        pass
+
+    return s
+
+# 初始化后是一个迭代器
+# 进行遍历时，先执行__iter__返回一个迭代器对象，然后一直执行__next__直到抛出StopIteration()异常
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=416):     #传入参数为输入图片文件夹，batch_size和img_size
-        if os.path.isdir(path):                 #文件夹读取，返回其下包含所有文件路径的列表，见notebook
-            image_format = ['.jpg', '.jpeg', '.png', '.tif']
-            self.files = sorted(glob.glob('%s/*.*' % path))
-            self.files = list(filter(lambda x: os.path.splitext(x)[1].lower() in image_format, self.files))
-        elif os.path.isfile(path):              #也可以直接添加图片路径
-            self.files = [path]
+    def __init__(self, path, img_size=416, half=False):
+        path = str(Path(path))  # os-agnostic
+        files = []
+        if os.path.isdir(path):
+            files = sorted(glob.glob(os.path.join(path, '*.*')))    # 返回路径下所有的文件绝对路径
+        elif os.path.isfile(path):
+            files = [path]
 
-        self.nF = len(self.files)       # number of image files
-        self.height = img_size
+        images = [x for x in files if os.path.splitext(x)[-1].lower() in img_formats]   # 筛选出支持的img_formats图片或者vid_formats视频类型
+        videos = [x for x in files if os.path.splitext(x)[-1].lower() in vid_formats]
+        nI, nV = len(images), len(videos)   
 
-        assert self.nF > 0, 'No images found in ' + path    #判断是否文件存在
-    
-    # RGB normalization values
-    def __iter__(self):      #这里的迭代器不太好理解，大概就是，初始化为count=-1，只进行一次，创建迭代对象
-        self.count = -1      #__iter__返回的self实例带着属性count=-1会进入__next__并且不再回头直到__next__抛出异常，下次进入重新创建迭代对象
+        self.img_size = img_size    
+        self.files = images + videos    # 所有待检测文件的list，采用images+viedos确保list的前面是图像后面是视频！
+        self.nF = nI + nV               # number of files  待检测的文件个数
+        self.video_flag = [False] * nI + [True] * nV    # len为文件个数，和上面的file list一一对应，eg.[False, False, False, False, False, True, True]说明有两个视频
+        self.mode = 'images'
+        self.half = half  # half precision fp16 images
+        if any(videos):     # any()全为False才返回False；也就是有video文件时执行下面的语句（除了是 0、空、FALSE 外都算 TRUE）
+            self.new_video(videos[0])  # new video
+        else:
+            self.cap = None
+        assert self.nF > 0, 'No images or videos found in ' + path
+
+    # __iter__方法决定该类是 可迭代类 。只循环一次，每次新的循环都要创建一个新的迭代器
+    def __iter__(self):
+        self.count = 0
         return self
-    
-    #(atten)类实例化后只要被迭代，每次迭代后return [img_path], img两个元素! 单个路径的列表形式和归一化并翻转后的像素矩阵（(c,w,h)和(rgb)）
-    def __next__(self):             #__iter__传过来的带count=-1的实例self在这里一直循环到抛出异常（遍历完毕，索引越界）
-        self.count += 1             #每次count+1，因此第一次运行的count实际是0
-        if self.count == self.nF:   #跑完全部文件，抛出异常，结束本次迭代
-            raise StopIteration
-        img_path = self.files[self.count]   #count为索引从0开始
 
-        # Read image
-        img0 = cv2.imread(img_path) #(atten)注意为BGR
-        assert img0 is not None, 'Failed to load ' + img_path
+    # __iter__方法决定该类是 迭代器类 。
+    def __next__(self):
+        if self.count == self.nF:
+            raise StopIteration         # 抛出StopIteration异常终止__next__方法迭代
+        path = self.files[self.count]   # 每次遍历取出self.files的一个文件
 
-        # Padded resize
-        #返回的img为按长边保持比例缩放到416后，放到图片中间，边缘填充灰色（因为color=(127.5, 127.5, 127.5))）的像素数组
-        #其他三个是缩放比例ratio,宽高的总填充量
-        img, _, _, _ = letterbox(img0, height=self.height)
+        if self.video_flag[self.count]: # 判断当前文件是否为video
+            # Read video
+            self.mode = 'video'
+            ret_val, img0 = self.cap.read() # ret_val是读取标识位，正确打开视频返回True
+            if not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nF:  # last video
+                    raise StopIteration
+                else:
+                    path = self.files[self.count]
+                    self.new_video(path)
+                    ret_val, img0 = self.cap.read()
+
+            self.frame += 1
+            print('video %g/%g (%g/%g) %s: ' % (self.count + 1, self.nF, self.frame, self.nframes, path), end='')
+
+        else:
+            # Read image
+            self.count += 1
+            img0 = cv2.imread(path)  # BGR
+            assert img0 is not None, 'Image Not Found ' + path
+            print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
+
+
+        # Padded resize 
+        # padding成长边416,短边32倍数，不足部分填充灰色的图像
+        img, *_ = letterbox(img0, new_shape=self.img_size)
 
         # Normalize RGB
-        #色彩数值归一化，并且翻转数据，最终结构是(c,w,h)和(rgb)
-        img = img[:, :, ::-1].transpose(2, 0, 1)    #(re)像素矩阵的翻转，比较麻烦，参见notebook注释
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        # img -= self.rgb_mean
-        # img /= self.rgb_std           #（可改）这两行代码还可以用于标准化处理        
-        img /= 255.0                    # 归一化
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float16 if self.half else np.float32)  # uint8 to fp16/fp32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
-        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
-        return img_path, img, img0
+        # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
+        return path, img, img0, self.cap
 
-    def __len__(self):      # 自定义len()方法，调用len()时会返回file数目
-        return self.nF      # number of files
+    def new_video(self, path):
+        self.frame = 0
+        self.cap = cv2.VideoCapture(path)
+        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def __len__(self):
+        return self.nF  # number of files
 
 
-#调用摄像头
 class LoadWebcam:  # for inference
-    def __init__(self, img_size=416):
-        self.cam = cv2.VideoCapture(0)
-        self.height = img_size
+    def __init__(self, pipe=0, img_size=416, half=False):
+        self.img_size = img_size
+        self.half = half  # half precision fp16 images
+
+        if pipe == '0':
+            pipe = 0  # local camera
+        # pipe = 'rtsp://192.168.1.64/1'  # IP camera
+        # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
+        # pipe = 'rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa'  # IP traffic camera
+        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
+
+        # https://answers.opencv.org/question/215996/changing-gstreamer-pipeline-to-opencv-in-pythonsolved/
+        # pipe = '"rtspsrc location="rtsp://username:password@192.168.1.64/1" latency=10 ! appsink'  # GStreamer
+
+        # https://answers.opencv.org/question/200787/video-acceleration-gstremer-pipeline-in-videocapture/
+        # https://stackoverflow.com/questions/54095699/install-gstreamer-support-for-opencv-python-package  # install help
+        # pipe = "rtspsrc location=rtsp://root:root@192.168.0.91:554/axis-media/media.amp?videocodec=h264&resolution=3840x2160 protocols=GST_RTSP_LOWER_TRANS_TCP ! rtph264depay ! queue ! vaapih264dec ! videoconvert ! appsink"  # GStreamer
+
+        self.pipe = pipe
+        self.cap = cv2.VideoCapture(pipe)  # video capture object
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # set buffer size
 
     def __iter__(self):
         self.count = -1
@@ -73,290 +153,549 @@ class LoadWebcam:  # for inference
 
     def __next__(self):
         self.count += 1
-        if cv2.waitKey(1) == 27:  # esc to quit
+        if cv2.waitKey(1) == ord('q'):  # q to quit
+            self.cap.release()
             cv2.destroyAllWindows()
             raise StopIteration
 
-        # Read image
-        ret_val, img0 = self.cam.read()
-        assert ret_val, 'Webcam Error'
-        img_path = 'webcam_%g.jpg' % self.count
-        img0 = cv2.flip(img0, 1)
+        # Read frame
+        if self.pipe == 0:  # local camera
+            ret_val, img0 = self.cap.read()
+            img0 = cv2.flip(img0, 1)  # flip left-right
+        else:  # IP camera
+            n = 0
+            while True:
+                n += 1
+                self.cap.grab()
+                if n % 30 == 0:  # skip frames
+                    ret_val, img0 = self.cap.retrieve()
+                    if ret_val:
+                        break
+
+        # Print
+        assert ret_val, 'Camera Error %s' % self.pipe
+        img_path = 'webcam.jpg'
+        print('webcam %g: ' % self.count, end='')
 
         # Padded resize
-        img, _, _, _ = letterbox(img0, height=self.height)
+        img, *_ = letterbox(img0, new_shape=self.img_size)
 
         # Normalize RGB
-        img = img[:, :, ::-1].transpose(2, 0, 1)
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float16 if self.half else np.float32)  # uint8 to fp16/fp32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
-        return img_path, img, img0
+        return img_path, img, img0, None
 
     def __len__(self):
         return 0
 
-#（re）这个函数实现了很多数据增广的操作，值得借鉴
-#部分中间变量见notebook
-class LoadImagesAndLabels:  # for training
-    def __init__(self, path, batch_size=1, img_size=608, multi_scale=False, augment=False):     #初始化类需要传入的参数
-        with open(path, 'r') as file:
-            self.img_files = file.readlines()
-            self.img_files = [x.replace('\n', '') for x in self.img_files]
-            self.img_files = list(filter(lambda x: len(x) > 0, self.img_files))
 
-        self.label_files = [x.replace('images', 'labels').replace('.png', '.txt').replace('.jpg', '.txt')
-                            for x in self.img_files]
+class LoadStreams:  # multiple IP or RTSP cameras
+    def __init__(self, sources='streams.txt', img_size=416, half=False):
+        self.mode = 'images'
+        self.img_size = img_size
+        self.half = half  # half precision fp16 images
 
-        self.nF = len(self.img_files)               # number of image files
-        self.nB = math.ceil(self.nF / batch_size)   # number of batches
-        self.batch_size = batch_size
-        self.height = img_size
-        self.multi_scale = multi_scale
-        self.augment = augment
+        if os.path.isfile(sources):
+            with open(sources, 'r') as f:
+                sources = [x.strip() for x in f.read().splitlines() if len(x.strip())]
+        else:
+            sources = [sources]
 
-        assert self.nB > 0, 'No images found in %s' % path
-    
-    #迭代器初始化
+        n = len(sources)
+        self.imgs = [None] * n
+        self.sources = sources
+        for i, s in enumerate(sources):
+            # Start the thread to read frames from the video stream
+            print('%g/%g: %s... ' % (i + 1, n, s), end='')
+            cap = cv2.VideoCapture(0 if s == '0' else s)
+            assert cap.isOpened(), 'Failed to open %s' % s
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) % 100
+            _, self.imgs[i] = cap.read()  # guarantee first frame
+            thread = Thread(target=self.update, args=([i, cap]), daemon=True)
+            print(' success (%gx%g at %.2f FPS).' % (w, h, fps))
+            thread.start()
+        print('')  # newline
+
+    def update(self, index, cap):
+        # Read next stream frame in a daemon thread
+        while cap.isOpened():
+            _, self.imgs[index] = cap.read()
+        time.sleep(0.030)  # 33.3 FPS to keep buffer empty
+
     def __iter__(self):
         self.count = -1
-        #如果开启了数据增广，产生随机序列，后面用于打乱图片；否则是一个有序的一维的array向量，长度为图片的数目
-        self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
         return self
-    #循环主体
+
     def __next__(self):
         self.count += 1
-        if self.count == self.nB:
+        img0 = self.imgs.copy()
+        if cv2.waitKey(1) == ord('q'):  # q to quit
+            cv2.destroyAllWindows()
             raise StopIteration
-            #这个是遍历起点终点
 
-        ia = self.count * self.batch_size
-        ib = min((self.count + 1) * self.batch_size, self.nF)
-        #多尺度训练
-        if self.multi_scale:
-            # Multi-Scale YOLO Training
-            height = random.choice(range(10, 20)) * 32  # 320 - 608 pixels
-        else:
-            # Fixed-Scale YOLO Training
-            height = self.height
+        # Letterbox
+        img = [letterbox(x, new_shape=self.img_size)[0] for x in img0]
 
-        img_all = []
-        labels_all = []
-        #range(ia, ib)遍历的是当前count计数的batch内的图片，
-        #比如batch_size=3,第一个count=0它遍历为0-2;count=1时，遍历的是3-5
-        #这样好处是遍历完图片的同时，返回的索引具有连贯性
-        for index, files_index in enumerate(range(ia, ib)):
-        #index是当前batch的索引，files_index是连续的索引，用于索引对应的图片
-            img_path = self.img_files[self.shuffled_vector[files_index]]
-            #（改）label的路径和图片在一起，这个最好改一下
-            label_path = self.label_files[self.shuffled_vector[files_index]]
+        # Stack
+        img = np.stack(img, 0)
 
-            img = cv2.imread(img_path)  # BGR
-            if img is None:
-                continue
+        # Normalize RGB
+        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float16 if self.half else np.float32)  # uint8 to fp16/fp32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
-            augment_hsv = True
-             #（re）hsv色彩空间变换
-            if self.augment and augment_hsv:
-            # SV augmentation by 50%：饱和度和明度提高50%
-                fraction = 0.50
-                img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  #色彩空间变换
-                #类似于BGR，HSV的shape=(w,h,c)，其中三通道的c[0,1,2]含有h,s,v信息
-                S = img_hsv[:, :, 1].astype(np.float32)
-                V = img_hsv[:, :, 2].astype(np.float32)
-
-                a = (random.random() * 2 - 1) * fraction + 1
-                S *= a
-                if a > 1:
-                    np.clip(S, a_min=0, a_max=255, out=S)
-
-                a = (random.random() * 2 - 1) * fraction + 1
-                V *= a
-                if a > 1:
-                    np.clip(V, a_min=0, a_max=255, out=V)
-
-                img_hsv[:, :, 1] = S.astype(np.uint8)
-                img_hsv[:, :, 2] = V.astype(np.uint8)
-                cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
-
-            h, w, _ = img.shape
-            #img是边界填充灰色后的height*height像素矩阵;缩放比ratio ;填充数目dw//2 dh//2
-            img, ratio, padw, padh = letterbox(img, height=height)
-
-            # Load labels
-            #label文件是yolo格式：class ,x,y,w,h（）后四者经过了原图的归一化
-            if os.path.isfile(label_path):
-                #np.loadtxt()直接将txt文件内容按行存成矩阵
-                #按照信息放成5列
-                labels0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 5)
-
-                # Normalized xywh to pixel xyxy format
-                #（atten）这里将yolo格式的xywh转换为xyxy是为了便于下面的仿射变换（后面还会改回来的；这个坐标的变换比较乱）
-                labels = labels0.copy()
-                #由于图片进行了缩放，所以gt的box也要按照ritio缩放
-                #（atten）这里注意了，为什么乘以w和h？因为他的gt坐标信息(xywh)是按照原图尺寸归一化过的（可以，这很yolo,和人家的一样了）
-                #相当于使用的是转化好的yolo格式标签
-                labels[:, 1] = ratio * w * (labels0[:, 1] - labels0[:, 3] / 2) + padw
-                labels[:, 2] = ratio * h * (labels0[:, 2] - labels0[:, 4] / 2) + padh
-                labels[:, 3] = ratio * w * (labels0[:, 1] + labels0[:, 3] / 2) + padw
-                labels[:, 4] = ratio * h * (labels0[:, 2] + labels0[:, 4] / 2) + padh
-            else:
-                labels = np.array([])
-
-            # Augment image and labels
-            #仿射变换（注意gt的box也要改）：实际包含若干仿射变换内容，random_affine()
-            #返回的M是综合的仿射变换矩阵
-            if self.augment:
-                img, labels, M = random_affine(img, labels, degrees=(-5, 5), translate=(0.10, 0.10), scale=(0.90, 1.10))
-            #(改)画图在这里被注销了
-            plotFlag = False
-            if plotFlag:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(10, 10)) if index == 0 else None
-                plt.subplot(4, 4, index + 1).imshow(img[:, :, ::-1])
-                plt.plot(labels[:, [1, 3, 3, 1, 1]].T, labels[:, [2, 2, 4, 4, 2]].T, '.-')
-                plt.axis('off')
-
-            nL = len(labels)    #ground truth的数目
-            if nL > 0:
-                # convert xyxy to xywh
-                #上面为了仿射变换改了坐标为xyxy，这里又改回xywh(atten，再次强调注意深拷贝copy)
-                #这次ground truth是对缩填充放后的图片为准进行归一化（不再是原图）
-                labels[:, 1:5] = xyxy2xywh(labels[:, 1:5].copy()) / height
-
-            if self.augment:
-                # random left-right flip
-                #（rondom）随机左右翻转（当然，除图像外也要gt的box同样操作）
-                lr_flip = True
-                if lr_flip & (random.random() > 0.5):
-                    img = np.fliplr(img)    #(atten)有函数直接翻转
-                    if nL > 0:
-                        labels[:, 1] = 1 - labels[:, 1]
-
-                # random up-down flip
-                #随机上下翻转
-                ud_flip = False
-                if ud_flip & (random.random() > 0.5):
-                    img = np.flipud(img)
-                    if nL > 0:
-                        labels[:, 2] = 1 - labels[:, 2]
-            #对一张图片遍历结束，列表存入图片信息矩阵和一个包含这张图所有gt的张量，notebook见
-            img_all.append(img)
-            labels_all.append(torch.from_numpy(labels))
-
-        # Normalize
-        img_all = np.stack(img_all)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB and cv2 to pytorch
-        img_all = np.ascontiguousarray(img_all, dtype=np.float32)
-        #（改）可选，中心化
-        # img_all -= self.rgb_mean
-        # img_all /= self.rgb_std
-        img_all /= 255.0
-
-        return torch.from_numpy(img_all), labels_all
+        return self.sources, img, img0, None
 
     def __len__(self):
-        return self.nB  # number of batches
+        return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
-def letterbox(img, height=416, color=(127.5, 127.5, 127.5)):  # resize a rectangular image to a padded square
-    shape = img.shape[:2]                # shape = [height, width]!
-    ratio = float(height) / max(shape)   # ratio  = old / new
-    new_shape = (round(shape[1] * ratio), round(shape[0] * ratio))  #计算按照长边保持比例缩放到height(416)的新shape列表：[new_height, new_width]
-    dw = (height - new_shape[0]) / 2  # width padding
-    dh = (height - new_shape[1]) / 2  # height padding缩放后图片填充到416*416,水平垂直方向各两侧需要填充的量
-    top, bottom = round(dh - 0.1), round(dh + 0.1)
-    left, right = round(dw - 0.1), round(dw + 0.1)
-    img = cv2.resize(img, new_shape, interpolation=cv2.INTER_AREA)  # resized, no border开始缩放：将原图按比例以长边缩放到416
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # padded square填充color为灰色(127.5, 127.5, 127.5)成416*416
-    return img, ratio, dw, dh
-    #返回值：
-    #1.边界填充后的数组（不是img,而是cv2.copyMakeBorder(xxx),也就是填充后的图片像素矩阵）
-    #2.缩放比ratio 
-    #3.填充数目dw//2 dh//2
-    #见notebook图片展示
+class LoadImagesAndLabels(Dataset):  # for training/testing
+    def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=True, image_weights=False,
+                 cache_labels=False, cache_images=False):
+        path = str(Path(path))  # os-agnostic
+        with open(path, 'r') as f:
+            self.img_files = [x.replace('/', os.sep) for x in f.read().splitlines()  # os-agnostic
+                              if os.path.splitext(x)[-1].lower() in img_formats]
+
+        n = len(self.img_files)
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        assert n > 0, 'No images found in %s' % path
+
+        self.n = n
+        self.batch = bi  # batch index of image
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+
+        # Define labels
+        self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
+                            for x in self.img_files]
+
+        # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
+        if self.rect:
+            # Read image shapes
+            sp = 'data' + os.sep + path.replace('.txt', '.shapes').split(os.sep)[-1]  # shapefile path
+            try:
+                with open(sp, 'r') as f:  # read existing shapefile
+                    s = [x.split() for x in f.read().splitlines()]
+                    assert len(s) == n, 'Shapefile out of sync'
+            except:
+                s = [exif_size(Image.open(f)) for f in tqdm(self.img_files, desc='Reading image shapes')]
+                np.savetxt(sp, s, fmt='%g')  # overwrites existing (if any)
+
+            # Sort by aspect ratio
+            s = np.array(s, dtype=np.float64)
+            ar = s[:, 1] / s[:, 0]  # aspect ratio
+            i = ar.argsort()
+            self.img_files = [self.img_files[i] for i in i]
+            self.label_files = [self.label_files[i] for i in i]
+            self.shapes = s[i]
+            ar = ar[i]
+
+            # Set training image shapes
+            shapes = [[1, 1]] * nb
+            for i in range(nb):
+                ari = ar[bi == i]
+                mini, maxi = ari.min(), ari.max()
+                if maxi < 1:
+                    shapes[i] = [maxi, 1]
+                elif mini > 1:
+                    shapes[i] = [1, 1 / mini]
+
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / 32.).astype(np.int) * 32
+
+        # Preload labels (required for weighted CE training)
+        self.imgs = [None] * n
+        self.labels = [None] * n
+        if cache_labels or image_weights:  # cache labels for faster training
+            self.labels = [np.zeros((0, 5))] * n
+            extract_bounding_boxes = False
+            create_datasubset = False
+            pbar = tqdm(self.label_files, desc='Reading labels')
+            nm, nf, ne, ns = 0, 0, 0, 0  # number missing, number found, number empty, number datasubset
+            for i, file in enumerate(pbar):
+                try:
+                    with open(file, 'r') as f:
+                        l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
+                except:
+                    nm += 1  # print('missing labels for image %s' % self.img_files[i])  # file missing
+                    continue
+
+                if l.shape[0]:
+                    assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                    assert (l >= 0).all(), 'negative labels: %s' % file
+                    assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                    self.labels[i] = l
+                    nf += 1  # file found
+
+                    # Create subdataset (a smaller dataset)
+                    if create_datasubset and ns < 1E4:
+                        if ns == 0:
+                            create_folder(path='./datasubset')
+                            os.makedirs('./datasubset/images')
+                        exclude_classes = 43
+                        if exclude_classes not in l[:, 0]:
+                            ns += 1
+                            # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
+                            with open('./datasubset/images.txt', 'a') as f:
+                                f.write(self.img_files[i] + '\n')
+
+                    # Extract object detection boxes for a second stage classifier
+                    if extract_bounding_boxes:
+                        p = Path(self.img_files[i])
+                        img = cv2.imread(str(p))
+                        h, w, _ = img.shape
+                        for j, x in enumerate(l):
+                            f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
+                            if not os.path.exists(Path(f).parent):
+                                os.makedirs(Path(f).parent)  # make new output folder
+                            box = xywh2xyxy(x[1:].reshape(-1, 4) * np.array([1, 1, 1.5, 1.5])).ravel()
+                            b = np.clip(box, 0, 1)  # clip boxes outside of image
+                            ret_val = cv2.imwrite(f, img[int(b[1] * h):int(b[3] * h), int(b[0] * w):int(b[2] * w)])
+                            assert ret_val, 'Failure extracting classifier boxes'
+                else:
+                    ne += 1  # file empty
+
+                pbar.desc = 'Reading labels (%g found, %g missing, %g empty for %g images)' % (nf, nm, ne, n)
+            assert nf > 0, 'No labels found. Recommend correcting image and label paths.'
+
+        # Cache images into memory for faster training (~5GB)
+        if cache_images and augment:  # if training
+            for i in tqdm(range(min(len(self.img_files), 10000)), desc='Reading images'):  # max 10k images
+                img_path = self.img_files[i]
+                img = cv2.imread(img_path)  # BGR
+                assert img is not None, 'Image Not Found ' + img_path
+                r = self.img_size / max(img.shape)  # size ratio
+                if self.augment and r < 1:  # if training (NOT testing), downsize to inference shape
+                    h, w, _ = img.shape
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # or INTER_AREA
+                self.imgs[i] = img
+
+        # Detect corrupted images https://medium.com/joelthchao/programmatically-detect-corrupted-image-8c1b2006c3d3
+        detect_corrupted_images = False
+        if detect_corrupted_images:
+            from skimage import io  # conda install -c conda-forge scikit-image
+            for file in tqdm(self.img_files, desc='Detecting corrupted images'):
+                try:
+                    _ = io.imread(file)
+                except:
+                    print('Corrupted image detected: %s' % file)
+
+    def __len__(self):
+        return len(self.img_files)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+
+    def __getitem__(self, index):
+        if self.image_weights:
+            index = self.indices[index]
+
+        img_path = self.img_files[index]
+        label_path = self.label_files[index]
+        hyp = self.hyp
+
+        # Load image
+        img = self.imgs[index]
+        if img is None:
+            img = cv2.imread(img_path)  # BGR
+            assert img is not None, 'Image Not Found ' + img_path
+            r = self.img_size / max(img.shape)  # size ratio
+            if self.augment and r < 1:  # if training (NOT testing), downsize to inference shape
+                h, w, _ = img.shape
+                img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # INTER_LINEAR fastest
+
+        # Augment colorspace
+        augment_hsv = True
+        if self.augment and augment_hsv:
+            # SV augmentation by 50%
+            img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # hue, sat, val
+            S = img_hsv[:, :, 1].astype(np.float32)  # saturation
+            V = img_hsv[:, :, 2].astype(np.float32)  # value
+
+            a = random.uniform(-1, 1) * hyp['hsv_s'] + 1
+            b = random.uniform(-1, 1) * hyp['hsv_v'] + 1
+            S *= a
+            V *= b
+
+            img_hsv[:, :, 1] = S if a < 1 else S.clip(None, 255)
+            img_hsv[:, :, 2] = V if b < 1 else V.clip(None, 255)
+            cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
+
+        # Letterbox
+        h, w, _ = img.shape
+        if self.rect:
+            shape = self.batch_shapes[self.batch[index]]
+            img, ratiow, ratioh, padw, padh = letterbox(img, new_shape=shape, mode='rect')
+        else:
+            shape = self.img_size
+            img, ratiow, ratioh, padw, padh = letterbox(img, new_shape=shape, mode='square')
+
+        # Load labels
+        labels = []
+        if os.path.isfile(label_path):
+            x = self.labels[index]
+            if x is None:  # labels not preloaded
+                with open(label_path, 'r') as f:
+                    x = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
+
+            if x.size > 0:
+                # Normalized xywh to pixel xyxy format
+                labels = x.copy()
+                labels[:, 1] = ratiow * w * (x[:, 1] - x[:, 3] / 2) + padw
+                labels[:, 2] = ratioh * h * (x[:, 2] - x[:, 4] / 2) + padh
+                labels[:, 3] = ratiow * w * (x[:, 1] + x[:, 3] / 2) + padw
+                labels[:, 4] = ratioh * h * (x[:, 2] + x[:, 4] / 2) + padh
+
+        # Augment image and labels
+        if self.augment:
+            img, labels = random_affine(img, labels,
+                                        degrees=hyp['degrees'],
+                                        translate=hyp['translate'],
+                                        scale=hyp['scale'],
+                                        shear=hyp['shear'])
+
+            # Cutout
+            if random.random() < 0.9:
+                labels = cutout(img, labels)
+
+        nL = len(labels)  # number of labels
+        if nL:
+            # convert xyxy to xywh
+            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])
+
+            # Normalize coordinates 0 - 1
+            labels[:, [2, 4]] /= img.shape[0]  # height
+            labels[:, [1, 3]] /= img.shape[1]  # width
+
+        if self.augment:
+            # random left-right flip
+            lr_flip = True
+            if lr_flip and random.random() < 0.5:
+                img = np.fliplr(img)
+                if nL:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+            # random up-down flip
+            ud_flip = False
+            if ud_flip and random.random() < 0.5:
+                img = np.flipud(img)
+                if nL:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+        labels_out = torch.zeros((nL, 6))
+        if nL:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Normalize
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+
+        return torch.from_numpy(img), labels_out, img_path, (h, w)
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, hw = list(zip(*batch))  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, hw
 
 
-#仿射变换包括：
-#Translation	+/- 10% (vertical and horizontal)
-#Rotation	+/- 5 degrees
-#Shear	+/- 2 degrees (vertical and horizontal)
-#Scale	+/- 10%
-def random_affine(img, targets=None, degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-2, 2),
-                  borderValue=(127.5, 127.5, 127.5)):
+def letterbox(img, new_shape=416, color=(128, 128, 128), mode='auto'):
+    # Resize a rectangular image to a 32 pixel multiple rectangle
+    # https://github.com/ultralytics/yolov3/issues/232
+    shape = img.shape[:2]  # current shape [height, width]
+
+    if isinstance(new_shape, int):
+        ratio = float(new_shape) / max(shape)
+    else:
+        ratio = max(new_shape) / max(shape)  # ratio  = new / old
+    ratiow, ratioh = ratio, ratio
+    #计算按照长边保持比例缩放到height(416)的新shape列表：[new_height, new_width
+    new_unpad = (int(round(shape[1] * ratio)), int(round(shape[0] * ratio)))    
+
+    # Compute padding https://github.com/ultralytics/yolov3/issues/232
+    if mode is 'auto':      # minimum rectangle    在原图缩放到长边416后，短边padding到32的整数倍以确保得到的特征图像素是整数
+        dw = np.mod(new_shape - new_unpad[0], 32) / 2  # width padding
+        dh = np.mod(new_shape - new_unpad[1], 32) / 2  # height padding实际padding的像素是dh,dw*2，dh代表两边各padding dh
+    elif mode is 'square':  # square    padding到416*416   
+        dw = (new_shape - new_unpad[0]) / 2  # width padding
+        dh = (new_shape - new_unpad[1]) / 2  # height padding
+    elif mode is 'rect':    # square    padding到416*416
+        dw = (new_shape[1] - new_unpad[0]) / 2  # width padding
+        dh = (new_shape[0] - new_unpad[1]) / 2  # height padding
+    elif mode is 'scaleFill':   # padding到416*416,但是改变了原来的宽高比例
+        dw, dh = 0.0, 0.0
+        new_unpad = (new_shape, new_shape)
+        ratiow, ratioh = new_shape / shape[1], new_shape / shape[0]
+
+    if shape[::-1] != new_unpad:  # resize
+        # 长边缩放到416
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_AREA)  # INTER_AREA is better, INTER_LINEAR is faster
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))    # 根据padding计算上下左右的填充量
+    # 填充color为灰色(128, 128, 128)
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+    return img, ratiow, ratioh, dw, dh
+
+
+def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # https://medium.com/uruvideo/dataset-augmentation-with-random-homographies-a8f4b44830d4
 
+    if targets is None:
+        targets = []
     border = 0  # width of added border (optional)
-    height = max(img.shape[0], img.shape[1]) + border * 2
+    height = img.shape[0] + border * 2
+    width = img.shape[1] + border * 2
 
     # Rotation and Scale
     R = np.eye(3)
-    a = random.random() * (degrees[1] - degrees[0]) + degrees[0]
-    # a += random.choice([-180, -90, 0, 90])  # 90deg rotations added to small rotations
-    s = random.random() * (scale[1] - scale[0]) + scale[0]
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(img.shape[1] / 2, img.shape[0] / 2), scale=s)
 
     # Translation
     T = np.eye(3)
-    T[0, 2] = (random.random() * 2 - 1) * translate[0] * img.shape[0] + border  # x translation (pixels)
-    T[1, 2] = (random.random() * 2 - 1) * translate[1] * img.shape[1] + border  # y translation (pixels)
+    T[0, 2] = random.uniform(-translate, translate) * img.shape[0] + border  # x translation (pixels)
+    T[1, 2] = random.uniform(-translate, translate) * img.shape[1] + border  # y translation (pixels)
 
     # Shear
     S = np.eye(3)
-    S[0, 1] = math.tan((random.random() * (shear[1] - shear[0]) + shear[0]) * math.pi / 180)  # x shear (deg)
-    S[1, 0] = math.tan((random.random() * (shear[1] - shear[0]) + shear[0]) * math.pi / 180)  # y shear (deg)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
 
     M = S @ T @ R  # Combined rotation matrix. ORDER IS IMPORTANT HERE!!
-    imw = cv2.warpPerspective(img, M, dsize=(height, height), flags=cv2.INTER_LINEAR,
-                              borderValue=borderValue)  # BGR order borderValue
+    imw = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_AREA,
+                         borderValue=(128, 128, 128))  # BGR order borderValue
 
     # Return warped points also
-    if targets is not None:
-        if len(targets) > 0:
-            n = targets.shape[0]
-            points = targets[:, 1:5].copy()
-            area0 = (points[:, 2] - points[:, 0]) * (points[:, 3] - points[:, 1])
+    if len(targets) > 0:
+        n = targets.shape[0]
+        points = targets[:, 1:5].copy()
+        area0 = (points[:, 2] - points[:, 0]) * (points[:, 3] - points[:, 1])
 
-            # warp points
-            xy = np.ones((n * 4, 3))
-            xy[:, :2] = points[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-            xy = (xy @ M.T)[:, :2].reshape(n, 8)
+        # warp points
+        xy = np.ones((n * 4, 3))
+        xy[:, :2] = points[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy = (xy @ M.T)[:, :2].reshape(n, 8)
 
-            # create new boxes
-            x = xy[:, [0, 2, 4, 6]]
-            y = xy[:, [1, 3, 5, 7]]
-            xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        # create new boxes
+        x = xy[:, [0, 2, 4, 6]]
+        y = xy[:, [1, 3, 5, 7]]
+        xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
 
-            # apply angle-based reduction
-            radians = a * math.pi / 180
-            reduction = max(abs(math.sin(radians)), abs(math.cos(radians))) ** 0.5
-            x = (xy[:, 2] + xy[:, 0]) / 2
-            y = (xy[:, 3] + xy[:, 1]) / 2
-            w = (xy[:, 2] - xy[:, 0]) * reduction
-            h = (xy[:, 3] - xy[:, 1]) * reduction
-            xy = np.concatenate((x - w / 2, y - h / 2, x + w / 2, y + h / 2)).reshape(4, n).T
+        # # apply angle-based reduction of bounding boxes
+        # radians = a * math.pi / 180
+        # reduction = max(abs(math.sin(radians)), abs(math.cos(radians))) ** 0.5
+        # x = (xy[:, 2] + xy[:, 0]) / 2
+        # y = (xy[:, 3] + xy[:, 1]) / 2
+        # w = (xy[:, 2] - xy[:, 0]) * reduction
+        # h = (xy[:, 3] - xy[:, 1]) * reduction
+        # xy = np.concatenate((x - w / 2, y - h / 2, x + w / 2, y + h / 2)).reshape(4, n).T
 
-            # reject warped points outside of image
-            np.clip(xy, 0, height, out=xy)
-            w = xy[:, 2] - xy[:, 0]
-            h = xy[:, 3] - xy[:, 1]
-            area = w * h
-            ar = np.maximum(w / (h + 1e-16), h / (w + 1e-16))
-            i = (w > 4) & (h > 4) & (area / (area0 + 1e-16) > 0.1) & (ar < 10)
+        # reject warped points outside of image
+        xy[:, [0, 2]] = xy[:, [0, 2]].clip(0, width)
+        xy[:, [1, 3]] = xy[:, [1, 3]].clip(0, height)
+        w = xy[:, 2] - xy[:, 0]
+        h = xy[:, 3] - xy[:, 1]
+        area = w * h
+        ar = np.maximum(w / (h + 1e-16), h / (w + 1e-16))
+        i = (w > 4) & (h > 4) & (area / (area0 + 1e-16) > 0.1) & (ar < 10)
 
-            targets = targets[i]
-            targets[:, 1:5] = xy[i]
+        targets = targets[i]
+        targets[:, 1:5] = xy[i]
 
-        return imw, targets, M
-    else:
-        return imw
+    return imw, targets
 
 
-def convert_tif2bmp(p='../xview/val_images_bmp'):
-    import glob
-    import cv2
-    files = sorted(glob.glob('%s/*.tif' % p))
-    for i, f in enumerate(files):
-        print('%g/%g' % (i + 1, len(files)))
-        cv2.imwrite(f.replace('.tif', '.bmp'), cv2.imread(f))
-        os.system('rm -rf ' + f)
+def cutout(image, labels):
+    # https://arxiv.org/abs/1708.04552
+    # https://github.com/hysts/pytorch_cutout/blob/master/dataloader.py
+    # https://towardsdatascience.com/when-conventional-wisdom-fails-revisiting-data-augmentation-for-self-driving-cars-4831998c5509
+    h, w = image.shape[:2]
+
+    def bbox_ioa(box1, box2, x1y1x2y2=True):
+        # Returns the intersection over box2 area given box1, box2. box1 is 4, box2 is nx4. boxes are x1y1x2y2
+        box2 = box2.transpose()
+
+        # Get the coordinates of bounding boxes
+        # x1, y1, x2, y2 = box1
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
+
+        # Intersection area
+        inter_area = (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) * \
+                     (np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)).clip(0)
+
+        # box2 area
+        box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + 1e-16
+
+        # Intersection over box2 area
+        return inter_area / box2_area
+
+    # random mask_size up to 50% image size
+    mask_h = random.randint(1, int(h * 0.5))
+    mask_w = random.randint(1, int(w * 0.5))
+
+    # box center
+    cx = random.randint(0, h)
+    cy = random.randint(0, w)
+
+    xmin = max(0, cx - mask_w // 2)
+    ymin = max(0, cy - mask_h // 2)
+    xmax = min(w, xmin + mask_w)
+    ymax = min(h, ymin + mask_h)
+
+    # apply random color mask
+    mask_color = [random.randint(0, 255) for _ in range(3)]
+    image[ymin:ymax, xmin:xmax] = mask_color
+
+    # return unobscured labels
+    if len(labels):
+        box = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
+        ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
+        labels = labels[ioa < 0.90]  # remove >90% obscured labels
+    return labels
+
+
+def convert_images2bmp():
+    # cv2.imread() jpg at 230 img/s, *.bmp at 400 img/s
+    for path in ['../coco/images/val2014/', '../coco/images/train2014/']:
+        folder = os.sep + Path(path).name
+        output = path.replace(folder, folder + 'bmp')
+        if os.path.exists(output):
+            shutil.rmtree(output)  # delete output folder
+        os.makedirs(output)  # make new output folder
+
+        for f in tqdm(glob.glob('%s*.jpg' % path)):
+            save_name = f.replace('.jpg', '.bmp').replace(folder, folder + 'bmp')
+            cv2.imwrite(save_name, cv2.imread(f))
+
+    for label_path in ['../coco/trainvalno5k.txt', '../coco/5k.txt']:
+        with open(label_path, 'r') as file:
+            lines = file.read()
+        lines = lines.replace('2014/', '2014bmp/').replace('.jpg', '.bmp').replace(
+            '/Users/glennjocher/PycharmProjects/', '../')
+        with open(label_path.replace('5k', '5k_bmp'), 'w') as file:
+            file.write(lines)
+
+
+def create_folder(path='./new_folder'):
+    # Create folder
+    if os.path.exists(path):
+        shutil.rmtree(path)  # delete output folder
+    os.makedirs(path)  # make new output folder

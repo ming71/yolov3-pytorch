@@ -1,374 +1,337 @@
-import os
-from collections import defaultdict
+import torch.nn.functional as F
 
-import torch.nn as nn
-
+from utils.google_utils import *
 from utils.parse_config import *
 from utils.utils import *
 
 ONNX_EXPORT = False
 
 
-def create_modules(module_defs):
-    """
-    Constructs module list of layer blocks from module configuration in module_defs
-    """ 
-    hyperparams = module_defs.pop(0)                    #移除并返回列表首元素：net配置下超参数
-    output_filters = [int(hyperparams['channels'])]     #图片通道数：3  （后面每层网络的输出通道都存放在这里）
-    module_list = nn.ModuleList()                       #module_list用于存储每个block,每个block对应cfg文件中一个块，类似[convolutional]里面就对应一个卷积块
-    for i, module_def in enumerate(module_defs):        #超参数net层被pop了，只剩网络层；返回模块索引i和模块信息module_def
-        # 这里每个块用nn.sequential()创建为了一个module，一个module有多个层，是时序容器，`Modules` 会以他们传入的顺序被添加到容器中
-        modules = nn.Sequential()
-        #下面根据不同的层进行设计(一次遍历添加一个层)
+def create_modules(module_defs, img_size, arc):
+    # Constructs module list of layer blocks from module configuration in module_defs
 
-        #卷积层（75个）
-        if module_def['type'] == 'convolutional':
-            bn = int(module_def['batch_normalize']) #bn是一个开关，cfg中batch_normalize是1需要加bn层，为0不加（看过cfg了，全加）
-            filters = int(module_def['filters'])    #卷积核数目
-            kernel_size = int(module_def['size'])   #卷积核尺寸
-            pad = (kernel_size - 1) // 2 if int(module_def['pad']) else 0
-            #pad=0该层不用padding，pad=1需要填充，并计算值。
-            #这个公式很巧妙，对于3*3的步长为2的降采样卷积核，可以使填充后计算得到1/2降采样效果，对于1*1卷积核，填充值计算为0不填充，所以作者实际把cfg的pad全置为1
-            
-            #开始添加卷积层：add_module(name,module) 将子模块加入当前的模块中，被添加的模块可以name来获取
-            #nn.Conv2d(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True)
-            modules.add_module('conv_%d' % i, nn.Conv2d(in_channels=output_filters[-1],#通道列表的最后一个数（上一层网络的输出通道数）
-                                                        out_channels=filters,          #输出通道数为该层卷积核
-                                                        kernel_size=kernel_size,
-                                                        stride=int(module_def['stride']),#卷积/池化步长
-                                                        padding=pad,
-                                                        bias=not bn))                   #加bn就不用偏置，可推导效果而言是一样的
-            #bn和激活层也为层，此处嵌套在卷积层内因为其他层没有采用这些（linear层恒等映射不算）
+    hyperparams = module_defs.pop(0)    # hyperparams是设置的超参数，pop出来就只剩下模型单元了
+    # 这个参数比较还重要！经过一个层（这里记录的是conv,route,shortcut）后如果输出的通道数会改变，卷积核个数也就是计算的输出通道数会被添加这个list，便于后面配置卷积层参数的输入通道（初始这里设置图像通道数3）
+    output_filters = [int(hyperparams['channels'])]     
+    module_list = nn.ModuleList()
+    routes = []  # list of layers which route to deeper layes,融合的层
+    yolo_index = -1
+
+    for i, mdef in enumerate(module_defs):
+        modules = nn.Sequential()   # 读一个block就放一个Sequential，如果是卷积层就直接conv+bn+relu安排上；如果是route层，则Sequential空着提供站位符的作用
+
+        if mdef['type'] == 'convolutional':
+            bn = int(mdef['batch_normalize'])   #bn是bool开关，cfg中batch_normalize是1需要加bn层，为0不加（cfg是全加的）
+            filters = int(mdef['filters'])      
+            kernel_size = int(mdef['size'])
+            pad = (kernel_size - 1) // 2 if int(mdef['pad']) else 0
+            modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters[-1],
+                                                   out_channels=filters,
+                                                   kernel_size=kernel_size,
+                                                   stride=int(mdef['stride']),
+                                                   padding=pad,
+                                                   bias=not bn))    
             if bn:
-                modules.add_module('batch_norm_%d' % i, nn.BatchNorm2d(filters))#nn.BatchNorm2d见notebook注释
-            if module_def['activation'] == 'leaky':
-                modules.add_module('leaky_%d' % i, nn.LeakyReLU(0.1)) #negative_slope=0.01
+                modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
+            if mdef['activation'] == 'leaky':   # TODO: activation study https://github.com/ultralytics/yolov3/issues/441
+                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+                # modules.add_module('activation', nn.PReLU(num_parameters=1, init=0.10))   # PReLU不错
+                # modules.add_module('activation', Swish())
 
-        #池化层（实际上全卷积，没有池化层）
-        elif module_def['type'] == 'maxpool':
-            kernel_size = int(module_def['size'])
-            stride = int(module_def['stride'])
-            if kernel_size == 2 and stride == 1:
-                modules.add_module('_debug_padding_%d' % i, nn.ZeroPad2d((0, 1, 0, 1)))
+        elif mdef['type'] == 'maxpool':
+            kernel_size = int(mdef['size'])
+            stride = int(mdef['stride'])
             maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=int((kernel_size - 1) // 2))
-            modules.add_module('maxpool_%d' % i, maxpool)
+            if kernel_size == 2 and stride == 1:  # yolov3-tiny
+                modules.add_module('ZeroPad2d', nn.ZeroPad2d((0, 1, 0, 1)))
+                modules.add_module('MaxPool2d', maxpool)
+            else:
+                modules = maxpool
 
-        #上采样层（2个）
-        elif module_def['type'] == 'upsample':
-            # upsample = nn.Upsample(scale_factor=int(module_def['stride']), mode='nearest')    
-            # WARNING: deprecated(torch.nn的报错，作者自己在下面重新继承了下)
-            upsample = Upsample(scale_factor=int(module_def['stride'])) #步长2，最近邻插值
-            modules.add_module('upsample_%d' % i, upsample)
+        elif mdef['type'] == 'upsample':
+            modules = nn.Upsample(scale_factor=int(mdef['stride']), mode='nearest')
 
-        #路由层
-        elif module_def['type'] == 'route':#见notebook注释
-            layers = [int(x) for x in module_def['layers'].split(',')]
-            filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])#卷积核数目为两层的加和，参见注释
-            modules.add_module('route_%d' % i, EmptyLayer())    #初始化为空,占位层
+        # 注意：route和shortcut的层在这里都不处理Sequential()是空的，只是把两者要融合的index放到routes list中去，后面forward再构建连接。
+        # route:[1, 5, 8, 12, 15, 18, 21, 24, 27, 30, 33, 37, 40, 43, 46, 49, 52, 55, 58, 62, 65, 68, 71, 79, 85, 61, 91, 97, 36]
+        # 共四处route，layer分别是-4,(-1,61),-4,(-1,36)，传入route的参数是79, 85, 61, 91, 97, 36
+        elif mdef['type'] == 'route':  
+            layers = [int(x) for x in mdef['layers'].split(',')]
+            filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])      
+            routes.extend([l if l > 0 else l + i for l in layers])
+            # if mdef[i+1]['type'] == 'reorg3d':
+            #     modules = nn.Upsample(scale_factor=1/float(mdef[i+1]['stride']), mode='nearest')  # reorg3d
 
-        #shortcut层（类似ResNet）
-        elif module_def['type'] == 'shortcut':
-            filters = output_filters[int(module_def['from'])]#分析见notebook
-            modules.add_module('shortcut_%d' % i, EmptyLayer())
+        # 共23个残差block，是sum加和的层
+        elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
+            filters = output_filters[int(mdef['from'])]     # sum输出通道和输入的相同
+            layer = int(mdef['from'])   # shortcut的layer全是-3
+            routes.extend([i + layer if layer < 0 else layer])   # i是当前模块的index，-3后就是往前数三个
 
-        #yolo层（三个特征层）
-        elif module_def['type'] == 'yolo':
-            anchor_idxs = [int(x) for x in module_def['mask'].split(',')]
-            # Extract anchors
-            #通过mask0-8决定每次使用哪三个anchor，传入YOLOLayer参数
-            anchors = [float(x) for x in module_def['anchors'].split(',')]
-            anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
-            anchors = [anchors[i] for i in anchor_idxs]
-            num_classes = int(module_def['classes'])
-            img_height = int(hyperparams['height']) #默认w=h，只提取一个就行
-            # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_height, anchor_idxs, cfg=hyperparams['cfg'])
-            modules.add_module('yolo_%d' % i, yolo_layer)
+        elif mdef['type'] == 'reorg3d':  # yolov3-spp-pan-scale
+            # torch.Size([16, 128, 104, 104])
+            # torch.Size([16, 64, 208, 208]) <-- # stride 2 interpolate dimensions 2 and 3 to cat with prior layer
+            pass
+
+        elif mdef['type'] == 'yolo':
+            yolo_index += 1   # 从0开始
+            mask = [int(x) for x in mdef['mask'].split(',')]  # anchor mask，cfg的anchor选择
+            modules = YOLOLayer(anchors=mdef['anchors'][mask],  # anchor list，用mask提取特定的三个anchor尺度，
+                                nc=int(mdef['classes']),  # number of classes,eg.20
+                                img_size=img_size,  # (416, 416)
+                                yolo_index=yolo_index,  # 三层
+                                arc=arc)  # yolo architecture
+
+            # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
+            # 用的是Focal Loss的3.3节提到的解决标签不平衡办法
+            try:
+                if arc == 'defaultpw' or arc == 'Fdefaultpw':  # default with positive weights
+                    b = [-4, -3.6]  # obj, cls
+                elif arc == 'default':  # default no pw (40 cls, 80 obj)    # 默认是这个
+                    b = [-5.5, -4.0]
+                elif arc == 'uBCE':  # unified BCE (80 classes)
+                    b = [0, -8.5]
+                elif arc == 'uCE':  # unified CE (1 background + 80 classes)
+                    b = [10, -0.1]
+                elif arc == 'Fdefault':  # Focal default no pw (28 cls, 21 obj, no pw)
+                    b = [-2.1, -1.8]
+                elif arc == 'uFBCE' or arc == 'uFBCEpw':  # unified FocalBCE (5120 obj, 80 classes)
+                    b = [0, -6.5]
+                elif arc == 'uFCE':  # unified FocalCE (64 cls, 1 background + 80 classes)
+                    b = [7.7, -1.1]
+
+                # 提取yolo层之前那个卷积的bias，torch.Size([3, 8])，3是anchor数目，8=5(xywhc,c为出现物体的置信度confidence)+3(类别数)
+                bias = module_list[-1][0].bias.view(len(mask), -1)  # 255 to 3x85  
+                bias[:, 4] += b[0] - bias[:, 4].mean()  # obj
+                bias[:, 5:] += b[1] - bias[:, 5:].mean()  # cls
+                # bias = torch.load('weights/yolov3-spp.bias.pt')[yolo_index]  # list of tensors [3x85, 3x85, 3x85]
+                module_list[-1][0].bias = torch.nn.Parameter(bias.view(-1))
+                # utils.print_model_biases(model)
+            except:
+                print('WARNING: smart bias initialization failure.')
+
+        else:
+            print('Warning: Unrecognized Layer Type: ' + mdef['type'])
 
         # Register module list and number of output filters
-        module_list.append(modules)     #将模型放在这个list中
-        output_filters.append(filters)  #将每一层的输出通道数记录（第一层为3输入图像通道），可以查看，代码实际没有调用
+        module_list.append(modules)     #  存放未连接的模型
+        output_filters.append(filters)  #  存放输出通道数变化的维度（用处是计算route层的融合的通道数，不会被返回的）
 
-    return hyperparams, module_list
+    return module_list, routes   # 最终返回的是modulelist和融合的通道位置
 
 
-class EmptyLayer(nn.Module):
-    """Placeholder for 'route' and 'shortcut' layers"""
-    #为shortcut layer / route layer 提供占位, 具体功能不在此实现，在Darknet类的forward函数中有体现
+class Swish(nn.Module):
     def __init__(self):
-        super(EmptyLayer, self).__init__()
+        super(Swish, self).__init__()
 
     def forward(self, x):
-        return x
-
-#torch.nn.upsample的上采样警报提醒，所以作者自定义了
-class Upsample(nn.Module):
-    # Custom Upsample layer (nn.Upsample gives deprecated warning message)
-
-    def __init__(self, scale_factor=1, mode='nearest'):
-        super(Upsample, self).__init__()
-        self.scale_factor = scale_factor
-        self.mode = mode
-
-    def forward(self, x):
-        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode) #根据给定输出size或倍率上采样或下采样数据
+        return x * torch.sigmoid(x)
 
 
 class YOLOLayer(nn.Module):
-    #分析以13*13特征图为例
-    def __init__(self, anchors, nC, img_dim, anchor_idxs, cfg):
-    #YOLOLayer实例化需要传入的参数：anchors, num_classes, img_height, anchor_idxs, cfg=hyperparams['cfg']
+    # 构造函数传入时：
+        # - anchor：    array([[116,90],[156,198],[373,326]]) （一组三个，还有两组）
+        # - nc:         20        (类别数)
+        # - img_size:   416
+        # - yolo_index: 0         (还有1,2)
+        # - arc ：      'default'
+    def __init__(self, anchors, nc, img_size, yolo_index, arc):     
         super(YOLOLayer, self).__init__()
+        self.anchors = torch.Tensor(anchors)
+        self.na = len(anchors)  # number of anchors (3)
+        self.nc = nc  # number of classes (80)
+        self.nx = 0  # initialize number of x gridpoints    
+        self.ny = 0  # initialize number of y gridpoints
+        self.arc = arc
 
-        anchors = [(a_w, a_h) for a_w, a_h in anchors]  # (pixels)#anchors不变，还是列表嵌套三个元组，但是将宽高提取赋值给了a_w和a_h
-        nA = len(anchors)
+        if ONNX_EXPORT:  # grids must be computed in __init__
+            stride = [32, 16, 8][yolo_index]  # stride of this layer
+            nx = int(img_size[1] / stride)  # number x grid points
+            ny = int(img_size[0] / stride)  # number y grid points
+            create_grids(self, img_size, (nx, ny))  
 
-        self.anchors = anchors
-        self.nA = nA                # number of anchors (3)
-        self.nC = nC                # number of classes (80)
-        self.bbox_attrs = 5 + nC    #每个box的回归的属性值数目4+1+class
-        self.img_dim = img_dim  # from hyperparams in cfg file, NOT from parser
-
-        #降采样步长，同时也是对应原图每个grid cell的尺寸！后面会用
-        if anchor_idxs[0] == (nA * 2):  # 6     #anchor_idxs[0]可能值为0,3,6
-            stride = 32                         #检测13*13特征图，降采样步长32
-        elif anchor_idxs[0] == nA:  # 3
-            stride = 16                         #检测26*26特征图，降采样步长16
+    def forward(self, p, img_size, var=None):   
+        if ONNX_EXPORT:
+            bs = 1  # batch size
         else:
-            stride = 8                          #检测52*52特征图，降采样步长8
+            bs, ny, nx = p.shape[0], p.shape[-2], p.shape[-1]   # ny nx是特征图的高和宽
+            if (self.nx, self.ny) != (nx, ny):
+                create_grids(self, img_size, (nx, ny), p.device, p.dtype)   # 缩放anchor到特征图尺寸;用特征图像素编码grid cell
 
-        if cfg.endswith('yolov3-tiny.cfg'):
-            stride *= 2                         #tiny-yolo3
+        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
+        p = p.view(bs, self.na, self.nc + 5, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
-        # Build anchor grids
-        #这段比较复杂，中间结果见notebook
-        nG = int(self.img_dim / stride)  # number grid points
-        # grid_x、grid_y用于 定位 feature map的网格左上角坐标，对特征图编号
-        self.grid_x = torch.arange(nG).repeat((nG, 1)).view((1, 1, nG, nG)).float() #shape:torch.Size([1, 1, 13, 13])
-        self.grid_y = torch.arange(nG).repeat((nG, 1)).t().view((1, 1, nG, nG)).float()
-        #将anchor也缩放到13*13（除32）尺寸上
-        #（atten）实际上预测的xywh都是在13*13的特征图上完成的，所以anchor作为预测的模板要缩放。最后会*32还原原图上去
-        self.anchor_wh = torch.FloatTensor([(a_w / stride, a_h / stride) for a_w, a_h in anchors])  # scale anchors
-        self.anchor_w = self.anchor_wh[:, 0].view((1, nA, 1, 1))    #将anchow的w，h分离
-        self.anchor_h = self.anchor_wh[:, 1].view((1, nA, 1, 1))
-        self.weights = class_weights()  #统计了coco的80类gt出现的归一化比重作为权值
+        # 这里直接用的是nn.Module的属性所以没有定义
+        if self.training:
+            return p
 
-        self.loss_means = torch.ones(6) #6维行向量，用1初始化
-        self.yolo_layer = anchor_idxs[0] / nA  # 2, 1, 0
-        self.stride = stride
-        self.nG = nG
+        elif ONNX_EXPORT:
+            # Constants CAN NOT BE BROADCAST, ensure correct shape!
+            ngu = self.ng.repeat((1, self.na * self.nx * self.ny, 1))
+            grid_xy = self.grid_xy.repeat((1, self.na, 1, 1, 1)).view((1, -1, 2))
+            anchor_wh = self.anchor_wh.repeat((1, 1, self.nx, self.ny, 1)).view((1, -1, 2)) / ngu
 
-        if ONNX_EXPORT:  # use fully populated and reshaped tensors
-            self.anchor_w = self.anchor_w.repeat((1, 1, nG, nG)).view(1, -1, 1)
-            self.anchor_h = self.anchor_h.repeat((1, 1, nG, nG)).view(1, -1, 1)
-            self.grid_x = self.grid_x.repeat(1, nA, 1, 1).view(1, -1, 1)
-            self.grid_y = self.grid_y.repeat(1, nA, 1, 1).view(1, -1, 1)
-            self.grid_xy = torch.cat((self.grid_x, self.grid_y), 2)
-            self.anchor_wh = torch.cat((self.anchor_w, self.anchor_h), 2) / nG
+            p = p.view(-1, 5 + self.nc)
+            xy = torch.sigmoid(p[..., 0:2]) + grid_xy[0]  # x, y
+            wh = torch.exp(p[..., 2:4]) * anchor_wh[0]  # width, height
+            p_conf = torch.sigmoid(p[:, 4:5])  # Conf
+            p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
+            return torch.cat((xy / ngu[0], wh, p_conf, p_cls), 1).t()
 
-    def forward(self, p, targets=None, var=None):
-    #p为传入的预测值，torch.Size([bs, 255, 13, 13])
-        bs = 1 if ONNX_EXPORT else p.shape[0]  # batch size
-        nG = self.nG if ONNX_EXPORT else p.shape[-1]  # number of grid points
+            # p = p.view(1, -1, 5 + self.nc)
+            # xy = torch.sigmoid(p[..., 0:2]) + grid_xy  # x, y
+            # wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
+            # p_conf = torch.sigmoid(p[..., 4:5])  # Conf
+            # p_cls = p[..., 5:5 + self.nc]
+            # # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
+            # # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
+            # p_cls = torch.exp(p_cls).permute((2, 1, 0))
+            # p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
+            # p_cls = p_cls.permute(2, 1, 0)
+            # return torch.cat((xy / ngu, wh, p_conf, p_cls), 2).squeeze().t()
 
-        if p.is_cuda and not self.weights.is_cuda:  #将所有参数都放到cuda上
-            self.grid_x, self.grid_y = self.grid_x.cuda(), self.grid_y.cuda()
-            self.anchor_w, self.anchor_h = self.anchor_w.cuda(), self.anchor_h.cuda()
-            self.weights, self.loss_means = self.weights.cuda(), self.loss_means.cuda()
+        else:  
+            # inference
+            # s = 1.5  # scale_xy  (pxy = pxy * s - (s - 1) / 2)
+            io = p.clone()  # inference output
+            io[..., 0:2] = torch.sigmoid(io[..., 0:2]) + self.grid_xy  # xy ：预测的偏移 + grid cell id
+            io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh    # wh yolo method （加exp化为正数）；wh预测的是一个比例，基准是anchor
+            # io[..., 2:4] = ((torch.sigmoid(io[..., 2:4]) * 2) ** 3) * self.anchor_wh  # wh power method
+            io[..., :4] *= self.stride
 
-        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 80)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.nA, self.bbox_attrs, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
-        #把255的列向量信息，加一个维度分开成3个box
-        #p的shape为：torch.Size([1, 3, 13, 13, 85]) ，(bs, anchors, grid, grid, xywh+conf+class)
-        #注意，当前YOLO层分配了3个anchor
+            if 'default' in self.arc:  # seperate obj and cls
+                # 将obj得分和各类别的得分进行sigmoid处理
+                torch.sigmoid_(io[..., 4:])     # in-place操作，慎用
+            elif 'BCE' in self.arc:  # unified BCE (80 classes)
+                torch.sigmoid_(io[..., 5:])
+                io[..., 4] = 1
+            elif 'CE' in self.arc:  # unified CE (1 background + 80 classes)
+                io[..., 4:] = F.softmax(io[..., 4:], dim=4)
+                io[..., 4] = 1
 
-        # Training
-        if targets is not None:
-            #坐标损失用均方差，分类损失用交叉熵
-            MSELoss = nn.MSELoss()                      #实例化均方损失函数
-            BCEWithLogitsLoss = nn.BCEWithLogitsLoss()  #交叉熵+sigmoid
-            CrossEntropyLoss = nn.CrossEntropyLoss()    #多分类交叉熵
+            if self.nc == 1:
+                io[..., 5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
 
-            # Get outputs
-            #训练前向传入这里的x,y用sigmoid归一化（这里的xy是相对于13*13特征图的每个像素的，转化为真实xy还需加上该grid cell的位置并乘以32）
-            x = torch.sigmoid(p[..., 0])  # Center x：torch.Size([1, 3, 13, 13]) ，1为bs
-            y = torch.sigmoid(p[..., 1])  # Center y
-            p_conf = p[..., 4]            # Conf： torch.Size([1, 3, 13, 13])
-            p_cls = p[..., 5:]            # Class：torch.Size([1, 3, 13, 13, 80])
-
-            # Width and height (yolo method)
-            w = p[..., 2]                 # Width：torch.Size([1, 3, 13, 13])
-            h = p[..., 3]                 # Height
-            # width = torch.exp(w.data) * self.anchor_w
-            # height = torch.exp(h.data) * self.anchor_h
-
-            # Width and height (power method)
-            # w = torch.sigmoid(p[..., 2])  # Width
-            # h = torch.sigmoid(p[..., 3])  # Height
-            # width = ((w.data * 2) ** 2) * self.anchor_w
-            # height = ((h.data * 2) ** 2) * self.anchor_h
-
-            tx, ty, tw, th, mask, tcls = build_targets(targets, self.anchor_wh, self.nA, self.nC, nG)
-
-            tcls = tcls[mask]
-            if x.is_cuda:
-                tx, ty, tw, th, mask, tcls = tx.cuda(), ty.cuda(), tw.cuda(), th.cuda(), mask.cuda(), tcls.cuda()
-
-            # Compute losses
-            nT = sum([len(x) for x in targets])  # number of targets
-            nM = mask.sum().float()  # number of anchors (assigned to targets)
-            nB = len(targets)  # batch size
-            k = nM / nB
-            if nM > 0:
-                lx = k * MSELoss(x[mask], tx[mask])
-                ly = k * MSELoss(y[mask], ty[mask])
-                lw = k * MSELoss(w[mask], tw[mask])
-                lh = k * MSELoss(h[mask], th[mask])
-
-                lcls = (k / 4) * CrossEntropyLoss(p_cls[mask], torch.argmax(tcls, 1))
-                # lcls = (k * 10) * BCEWithLogitsLoss(p_cls[mask], tcls.float())
-            else:
-                FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
-                lx, ly, lw, lh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
-
-            lconf = (k * 64) * BCEWithLogitsLoss(p_conf, mask.float())
-
-            # Sum loss components
-            loss = lx + ly + lw + lh + lconf + lcls
-
-            return loss, loss.item(), lx.item(), ly.item(), lw.item(), lh.item(), lconf.item(), lcls.item(), nT
-
-        else:
-            #不训练只是检测前向传播：
-            if ONNX_EXPORT:
-                # p = p.view(-1, 85)
-                # xy = torch.sigmoid(p[:, 0:2]) + self.grid_xy[0]  # x, y
-                # wh = torch.exp(p[:, 2:4]) * self.anchor_wh[0]  # width, height
-                # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
-                # p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
-                # return torch.cat((xy / nG, wh, p_conf, p_cls), 1).t()
-
-                p = p.view(1, -1, 85)
-                xy = torch.sigmoid(p[..., 0:2]) + self.grid_xy  # x, y
-                wh = torch.exp(p[..., 2:4]) * self.anchor_wh  # width, height
-                p_conf = torch.sigmoid(p[..., 4:5])  # Conf
-                p_cls = p[..., 5:85]
-                # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
-                # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
-                p_cls = torch.exp(p_cls).permute((2, 1, 0))
-                p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
-                p_cls = p_cls.permute(2, 1, 0)
-                return torch.cat((xy / nG, wh, p_conf, p_cls), 2).squeeze().t()
-
-
-            #（atten）经过前向传播得到的坐标参数，是416*416上的真实参数
-            # p的shape为：torch.Size([1, 3, 13, 13, 85]) ，(bs, anchors, grid, grid, xywh+conf+class)
-            # 前xywh处理:前面维度不管，只取最后维85信息的前四个，并且xy进行sigmoid归一化后加上左上定位坐标，wh取指数得到正的比例信息乘以anchor即可
-            # xy得到的是在一个cell的相对比例信息，乘以降采样步长缩放到全图
-            # wh为什么也要扩大32倍？因为实际上预测是在13*13的特征图进行的！所以预测出的坐标xywh都是基于13*13的，故均要缩放
-            p[..., 0] = torch.sigmoid(p[..., 0]) + self.grid_x  # x
-            p[..., 1] = torch.sigmoid(p[..., 1]) + self.grid_y  # y
-            p[..., 2] = torch.exp(p[..., 2]) * self.anchor_w  # width
-            p[..., 3] = torch.exp(p[..., 3]) * self.anchor_h  # height
-            p[..., 4] = torch.sigmoid(p[..., 4])  # p_conf
-            p[..., :4] *= self.stride
-
-            # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
-            return p.view(bs, -1, 5 + self.nC)
+            # 注意：yolo层返回两个张量
+            return io.view(bs, -1, 5 + self.nc), p
 
 
 class Darknet(nn.Module):
-    """YOLOv3 object detection model"""
+    # YOLOv3 object detection model
+    def __init__(self, cfg, img_size=(416, 416), arc='default'):
+        super(Darknet, self).__init__()     # 超类继承
+        self.module_defs = parse_model_cfg(cfg)     # 返回包含cfg组件dict的list便于调用
+        self.module_list, self.routes = create_modules(self.module_defs, img_size, arc)  # 搭建模型（只是堆叠没有连接，连接实现在forword，动态图）以及要融合的位置index（残差结构和多尺度concat两部分）
+        self.yolo_layers = get_yolo_layers(self)    # yolo层的index: [82, 94, 106]
 
-    def __init__(self, cfg_path, img_size=416): #类传入两个参数初始化：cfg_path和img_size
-        super(Darknet, self).__init__()         #继承父类的构造函数，继承自nn.Module可以直接不传递参数，如果是高阶类需要根据具体情况而定传递参数
-        #注意：module_defs是一个嵌套的列表,外层列表内层嵌套的是字典
-        self.module_defs = parse_model_cfg(cfg_path)    #parse_model_config()返回模型的参数信息，见notebook
-        self.module_defs[0]['cfg'] = cfg_path
-        self.module_defs[0]['height'] = img_size        #如第一个配置模块net的字典键值对height:416
-        
-        self.hyperparams, self.module_list = create_modules(self.module_defs)   #获取net网络配置参数和搭建模型结构（darknet-53）
-        self.img_size = img_size
-        self.loss_names = ['loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'nT']
-        self.losses = []
+        # Darknet Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
+        # 关于darknet版本的问题
+        self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
+        self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
 
-    def forward(self, x, targets=None, var=0):
-        self.losses = defaultdict(float)    #loss全局初始化为0.0
-        is_training = targets is not None   #如果targets=None返回false，后面不训练
-        layer_outputs = []                  #存储每层输出（包含yolo层）
-        output = []                         #存储YOLO层的检测输出
+    def forward(self, x, var=None):     
 
-        #见notebook(模型架构剖析)
-        for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
-            if module_def['type'] in ['convolutional', 'upsample', 'maxpool']:
-                x = module(x)   #直接计算前向输出
-            elif module_def['type'] == 'route':
-                layer_i = [int(x) for x in module_def['layers'].split(',')] #[-4],[-1,61],[-4],[-1,36]
-                if len(layer_i) == 1:
-                    x = layer_outputs[layer_i[0]]
+        img_size = x.shape[-2:] # 取出hw
+        layer_outputs = []      # 所有route层的输出
+        output = []             # 三个yolo层的输出
+
+      
+        for i, (mdef, module) in enumerate(zip(self.module_defs, self.module_list)):
+            mtype = mdef['type']
+            if mtype in ['convolutional', 'upsample', 'maxpool']:
+                x = module(x)
+            elif mtype == 'route':         
+                layers = [int(x) for x in mdef['layers'].split(',')]    #[-4],[-1,61],[-4],[-1,36]
+                if len(layers) == 1:
+                    x = layer_outputs[layers[0]]    # 这种层是取出yolo往前的四层得到参数进入下一个yolo分支
                 else:
-                    x = torch.cat([layer_outputs[i] for i in layer_i], 1)   #按第一维度（刨去batch维）融合
-            elif module_def['type'] == 'shortcut':
-                layer_i = int(module_def['from'])
-                x = layer_outputs[-1] + layer_outputs[layer_i]   #加和其上一层-1，当前层不是-1执行最后才append）和往上数第三层(-3)
-            elif module_def['type'] == 'yolo':
-                # Train phase: get loss
-                if is_training:
-                    #module[0]是YOLOLayer()，后面4个是向YOLO层传递进去的参数，根据自定义方式计算前向传播
-                    x, *losses = module[0](x, targets, var)
-                    for name, loss in zip(self.loss_names, losses):
-                        self.losses[name] += loss
-                # Test phase: Get detections
-                else:
-                    x = module(x)   #训练需要计算损失函数，检测直接前向计算结果就行
-                output.append(x)    #存储yolo层前向传播结果
-            layer_outputs.append(x) #所有层输出
+                    try:
+                        x = torch.cat([layer_outputs[i] for i in layers], 1)    #按第一维度（刨去batch维）concat融合
+                    except:  # apply stride 2 for darknet reorg layer
+                        layer_outputs[layers[1]] = F.interpolate(layer_outputs[layers[1]], scale_factor=[0.5, 0.5])
+                        x = torch.cat([layer_outputs[i] for i in layers], 1)
+                    # print(''), [print(layer_outputs[i].shape) for i in layers], print(x.shape)
+            elif mtype == 'shortcut':
+                x = x + layer_outputs[int(mdef['from'])]    # 残差连接，加和其上一层-1（当前层不是-1执行最后才append）和往上数第三层(-3)
+            elif mtype == 'yolo':
+                x = module(x, img_size) 
+                output.append(x)                                    # 添加三个yolo层的输出
+            layer_outputs.append(x if i in self.routes else [])     # 添加所有route层的输出
 
-        if is_training:
-            self.losses['nT'] /= 3  # target category
+        if self.training:
+            return output
+        elif ONNX_EXPORT:
+            output = torch.cat(output, 1)  # cat 3 layers 85 x (507, 2028, 8112) to 85 x 10647
+            nc = self.module_list[self.yolo_layers[0]].nc  # number of classes
+            return output[5:5 + nc].t(), output[:4].t()  # ONNX scores, boxes
+        else:
+            io, p = list(zip(*output))  # inference output, training output
+            import ipdb; ipdb.set_trace()
+            return torch.cat(io, 1), p  # 保留bs(1)和数据(5+classes)维度,将中间的proposal进行concat(每个yolo层预测其特征图的w*h*3个proposal)
 
-        if ONNX_EXPORT:
-            output = torch.cat(output, 1)  # merge the 3 layers 85 x (507, 2028, 8112) to 85 x 10647
-            return output[5:85].t(), output[:4].t()  # ONNX scores, boxes
+    def fuse(self):
+        # Fuse Conv2d + BatchNorm2d layers throughout model
+        fused_list = nn.ModuleList()
+        for a in list(self.children())[0]:
+            if isinstance(a, nn.Sequential):
+                for i, b in enumerate(a):
+                    if isinstance(b, nn.modules.batchnorm.BatchNorm2d):
+                        # fuse this bn layer with the previous conv2d layer
+                        conv = a[i - 1]
+                        fused = torch_utils.fuse_conv_and_bn(conv, b)
+                        a = nn.Sequential(fused, *list(a.children())[i + 1:])
+                        break
+            fused_list.append(a)
+        self.module_list = fused_list
+        # model_info(self)  # yolov3-spp reduced from 225 to 152 layers
 
-        return sum(output) if is_training else torch.cat(output, 1)
+
+def get_yolo_layers(model):
+    return [i for i, x in enumerate(model.module_defs) if x['type'] == 'yolo']  # [82, 94, 106] for yolov3
+
+
+  
+def create_grids(self, img_size=416, ng=(13, 13), device='cpu', type=torch.float32):
+    nx, ny = ng  # x and y grid size # ng是传入的特征图宽高tuple
+    # 计算降采样步长self.stride 32/16/8
+    self.img_size = max(img_size)
+    self.stride = self.img_size / max(ng)   
+
+    # build xy offsets
+    # 最终结果self.grid_xy的维度为torch.Size([1, 1, 10, 13, 2])，其中10和13的维度对应的是特征图的每个点，最后的2是其上的编号
+    yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+    self.grid_xy = torch.stack((xv, yv), 2).to(device).type(type).view((1, 1, ny, nx, 2))
+
+    # build wh gains
+    self.anchor_vec = self.anchors.to(device) / self.stride     # 预测是在特征图上进行的，所以anchor也要除以降采样stride缩小到特征图尺度上去
+    self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2).to(device).type(type)    # self.na为anchor个数3
+    self.ng = torch.Tensor(ng).to(device)
+    self.nx = nx
+    self.ny = ny
 
 
 def load_darknet_weights(self, weights, cutoff=-1):
-    #这里包括后面的self都是传入的模型
     # Parses and loads the weights stored in 'weights'
-    # cutoff: save layers between 0 and cutoff (if cutoff = -1 all are saved)
-    weights_file = weights.split(os.sep)[-1]
 
-    # Try to download weights if not available locally
-    if not os.path.isfile(weights):
-        try:
-            os.system('wget https://pjreddie.com/media/files/' + weights_file + ' -O ' + weights)
-        except IOError:
-            print(weights + ' not found')
-
-    # Establish cutoffs
-    if weights_file == 'darknet53.conv.74':
+    # Establish cutoffs (load layers between 0 and cutoff. if cutoff = -1 all are loaded)
+    file = Path(weights).name
+    if file == 'darknet53.conv.74':
         cutoff = 75
-    elif weights_file == 'yolov3-tiny.conv.15':
-        cutoff = 16
+    elif file == 'yolov3-tiny.conv.15':
+        cutoff = 15
 
-    # Open the weights file
-    fp = open(weights, 'rb')
-    header = np.fromfile(fp, dtype=np.int32, count=5)  # First five are header values
+    # Read weights file
+    with open(weights, 'rb') as f:
+        # Read Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
+        self.version = np.fromfile(f, dtype=np.int32, count=3)  # (int32) version info: major, minor, revision
+        self.seen = np.fromfile(f, dtype=np.int64, count=1)  # (int64) number of images seen during training
 
-    # Needed to write header when saving weights
-    self.header_info = header
-
-    self.seen = header[3]  # number of images seen during training
-    weights = np.fromfile(fp, dtype=np.float32)  # The rest are weights
-    fp.close()
+        weights = np.fromfile(f, dtype=np.float32)  # The rest are weights
 
     ptr = 0
-    for i, (module_def, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
-        if module_def['type'] == 'convolutional':
+    for i, (mdef, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
+        if mdef['type'] == 'convolutional':
             conv_layer = module[0]
-            if module_def['batch_normalize']:
+            if mdef['batch_normalize']:
                 # Load BN bias, weights, running mean and running variance
                 bn_layer = module[1]
                 num_b = bn_layer.bias.numel()  # Number of biases
@@ -400,33 +363,90 @@ def load_darknet_weights(self, weights, cutoff=-1):
             conv_layer.weight.data.copy_(conv_w)
             ptr += num_w
 
-
-"""
-    @:param path    - path of the new weights file
-    @:param cutoff  - save layers between 0 and cutoff (cutoff = -1 -> all are saved)
-"""
+    return cutoff
 
 
-def save_weights(self, path, cutoff=-1):
-    fp = open(path, 'wb')
-    self.header_info[3] = self.seen  # number of images seen during training
-    self.header_info.tofile(fp)
+def save_weights(self, path='model.weights', cutoff=-1):
+    # Converts a PyTorch model to Darket format (*.pt to *.weights)
+    # Note: Does not work if model.fuse() is applied
+    with open(path, 'wb') as f:
+        # Write Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
+        self.version.tofile(f)  # (int32) version info: major, minor, revision
+        self.seen.tofile(f)  # (int64) number of images seen during training
 
-    # Iterate through layers
-    for i, (module_def, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
-        if module_def['type'] == 'convolutional':
-            conv_layer = module[0]
-            # If batch norm, load bn first
-            if module_def['batch_normalize']:
-                bn_layer = module[1]
-                bn_layer.bias.data.cpu().numpy().tofile(fp)
-                bn_layer.weight.data.cpu().numpy().tofile(fp)
-                bn_layer.running_mean.data.cpu().numpy().tofile(fp)
-                bn_layer.running_var.data.cpu().numpy().tofile(fp)
-            # Load conv bias
-            else:
-                conv_layer.bias.data.cpu().numpy().tofile(fp)
-            # Load conv weights
-            conv_layer.weight.data.cpu().numpy().tofile(fp)
+        # Iterate through layers
+        for i, (mdef, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
+            if mdef['type'] == 'convolutional':
+                conv_layer = module[0]
+                # If batch norm, load bn first
+                if mdef['batch_normalize']:
+                    bn_layer = module[1]
+                    bn_layer.bias.data.cpu().numpy().tofile(f)
+                    bn_layer.weight.data.cpu().numpy().tofile(f)
+                    bn_layer.running_mean.data.cpu().numpy().tofile(f)
+                    bn_layer.running_var.data.cpu().numpy().tofile(f)
+                # Load conv bias
+                else:
+                    conv_layer.bias.data.cpu().numpy().tofile(f)
+                # Load conv weights
+                conv_layer.weight.data.cpu().numpy().tofile(f)
 
-    fp.close()
+
+def convert(cfg='cfg/yolov3-spp.cfg', weights='weights/yolov3-spp.weights'):
+    # Converts between PyTorch and Darknet format per extension (i.e. *.weights convert to *.pt and vice versa)
+    # from models import *; convert('cfg/yolov3-spp.cfg', 'weights/yolov3-spp.weights')
+
+    # Initialize model
+    model = Darknet(cfg)
+
+    # Load weights and save
+    if weights.endswith('.pt'):  # if PyTorch format
+        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
+        save_weights(model, path='converted.weights', cutoff=-1)
+        print("Success: converted '%s' to 'converted.weights'" % weights)
+
+    elif weights.endswith('.weights'):  # darknet format
+        _ = load_darknet_weights(model, weights)
+
+        chkpt = {'epoch': -1,
+                 'best_fitness': None,
+                 'training_results': None,
+                 'model': model.state_dict(),
+                 'optimizer': None}
+
+        torch.save(chkpt, 'converted.pt')
+        print("Success: converted '%s' to 'converted.pt'" % weights)
+
+    else:
+        print('Error: extension not supported.')
+
+# 如果weights指定的权重不存在，则下载；存在则该函数不返回直接pass
+def attempt_download(weights):
+    # Attempt to download pretrained weights if not found locally
+    msg = weights + ' missing, download from https://drive.google.com/drive/folders/1uxgUBemJVw9wZsdpboYbzUN4bcRhsuAI'
+    if weights and not os.path.isfile(weights): # 指定路径的权值文件不存在
+        file = Path(weights).name   # 分割路径文件名
+
+        if file == 'yolov3-spp.weights':
+            gdrive_download(id='1oPCHKsM2JpM-zgyepQciGli9X0MTsJCO', name=weights)
+        elif file == 'yolov3-spp.pt':
+            gdrive_download(id='1vFlbJ_dXPvtwaLLOu-twnjK4exdFiQ73', name=weights)
+        elif file == 'yolov3.pt':
+            gdrive_download(id='11uy0ybbOXA2hc-NJkJbbbkDwNX1QZDlz', name=weights)
+        elif file == 'yolov3-tiny.pt':
+            gdrive_download(id='1qKSgejNeNczgNNiCn9ZF_o55GFk1DjY_', name=weights)
+        elif file == 'darknet53.conv.74':
+            gdrive_download(id='18xqvs_uwAqfTXp-LJCYLYNHBOcrwbrp0', name=weights)
+        elif file == 'yolov3-tiny.conv.15':
+            gdrive_download(id='140PnSedCsGGgu3rOD6Ez4oI6cdDzerLC', name=weights)
+
+        else:
+            try:  # download from pjreddie.com
+                url = 'https://pjreddie.com/media/files/' + file
+                print('Downloading ' + url)
+                os.system('curl -f ' + url + ' -o ' + weights)
+            except IOError:
+                print(msg)
+                os.system('rm ' + weights)  # remove partial downloads
+
+        assert os.path.exists(weights), msg  # download missing weights from Google Drive
