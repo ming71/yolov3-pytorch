@@ -1,6 +1,0 @@
-classes=3
-train=/py/datasets/ship/tiny_ships/yolo_ship/train.txt
-valid=/py/datasets/ship/tiny_ships/yolo_ship/val.txt
-names=data/ship.names
-backup=backup/
-eval=coco

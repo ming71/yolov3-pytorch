@@ -13,9 +13,6 @@ wget -c https://pjreddie.com/media/files/val2014.zip
 unzip -q train2014.zip
 unzip -q val2014.zip
 
-# (optional) Delete zip files
-rm -rf *.zip
-
 cd ..
 
 # Download COCO Metadata
@@ -36,4 +33,4 @@ paste <(awk "{print \"$PWD\"}" <trainvalno5k.part) trainvalno5k.part | tr -d '\t
 # sudo rm -rf train_images/._*
 # lastly convert each .tif to a .bmp for faster loading in cv2
 
-# ./coco/images/train2014/COCO_train2014_000000167126.jpg  # corrupted image
+# /home/glenn_jocher3/coco/images/train2014/COCO_train2014_000000167126.jpg  # bad image??

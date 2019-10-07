@@ -1,6 +1,7 @@
 import argparse
 import time
-
+import visdom
+import numpy as np
 import test  # Import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
@@ -38,7 +39,7 @@ def train(
     model = Darknet(cfg, img_size)
 
     # Get dataloader数据增强
-    dataloader = LoadImagesAndLabels(train_path, batch_size, img_size, multi_scale=multi_scale, augment=True)
+    dataloader = LoadImagesAndLabels(train_path, batch_size, img_size, multi_scale=multi_scale, augment=False)
 
     lr0 = 0.001
     if resume:  #断点继续训练
@@ -87,7 +88,7 @@ def train(
     # Set scheduler
     # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[54, 61], gamma=0.1)
 
-    model_info(model)   #（re）该函数打印出网络结构,utils.py注释，&notebook(模型结构打印)
+    #model_info(model)   #（re）该函数打印出网络结构,utils.py注释，&notebook(模型结构打印)
     t0 = time.time()
     
     #对所有样本进行每轮前向后向传播
@@ -156,6 +157,18 @@ def train(
                 '%g/%g' % (epoch, epochs - 1), '%g/%g' % (i, len(dataloader) - 1), rloss['x'],
                 rloss['y'], rloss['w'], rloss['h'], rloss['conf'], rloss['cls'],
                 rloss['loss'], model.losses['nT'], time.time() - t0)
+                
+#            print(rloss['x'])
+#            a=input()
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['loss']]),win='loss',update='append',opts=dict(showlegend=True,legend=['loss'])) 
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['x']]),win='loss-x',update='append',opts=dict(showlegend=True,legend=['loss-x']))  
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['y']]),win='loss-y',update='append',opts=dict(showlegend=True,legend=['loss-y']))  
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['w']]),win='loss-w',update='append',opts=dict(showlegend=True,legend=['loss-w']))  
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['h']]),win='loss-h',update='append',opts=dict(showlegend=True,legend=['loss-h']))  
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['conf']]),win='loss-conf',update='append',opts=dict(showlegend=True,legend=['loss-conf']))
+            vis.line(X=np.array([epoch]),Y=np.array([rloss['cls']]),win='loss-cls',update='append',opts=dict(showlegend=True,legend=['loss-cls']))    
+            
+                        
             t0 = time.time()
             print(s)
 
@@ -176,16 +189,16 @@ def train(
             os.system('cp ' + latest + ' ' + best)
 
         # Save backup weights every 5 epochs
-        if (epoch > 0) & (epoch % 5 == 0):
+        if (epoch > 0) & (epoch % 50 == 0):
             os.system('cp ' + latest + ' ' + os.path.join(weights, 'backup{}.pt'.format(epoch)))
 
         # Calculate mAP
-        with torch.no_grad():
-            mAP, R, P = test.test(cfg, data_cfg, weights=latest, batch_size=batch_size, img_size=img_size)
+#        with torch.no_grad():
+#            mAP, R, P = test.test(cfg, data_cfg, weights=latest, batch_size=batch_size, img_size=img_size)
 
         # Write epoch results
-        with open('results.txt', 'a') as file:
-            file.write(s + '%11.3g' * 3 % (mAP, P, R) + '\n')
+#        with open('results.txt', 'a') as file:
+#            file.write(s + '%11.3g' * 3 % (mAP, P, R) + '\n')
 
 
 if __name__ == '__main__':
@@ -193,7 +206,7 @@ if __name__ == '__main__':
     #'--multi-scale'接受参数输入后，执行动作"store_true"改为 True
     #断点继续训练，同样'--resume'接受参数输入，执行动作"store_true"改为 True，在latest.pt基础上继续训练
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--batch-size', type=int, default=1, help='size of each image batch')
     parser.add_argument('--accumulated-batches', type=int, default=1, help='number of batches before optimizer step')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
     parser.add_argument('--data-cfg', type=str, default='cfg/coco.data', help='coco.data file path')
@@ -209,6 +222,8 @@ if __name__ == '__main__':
     init_seeds()
 
     torch.cuda.empty_cache()
+    
+    vis = visdom.Visdom(env='yolov3')
     
     train(
         opt.cfg,
