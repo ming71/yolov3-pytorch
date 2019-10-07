@@ -1,5 +1,5 @@
 # Update
-This repo will be updated to recent version refer to offical code **in a week**.
+This repo has been updated to recent version.More details and annotations can be found in code.
 
 # yolov3-pytorch<br>
 **Annotation** and **Specification** for yolov3 <br>  
