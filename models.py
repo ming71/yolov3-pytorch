@@ -244,7 +244,7 @@ class Darknet(nn.Module):
     def forward(self, x, var=None):     # x是传入的缩放和padding后的像素矩阵
 
         img_size = x.shape[-2:] # 取出hw
-        layer_outputs = []      # 所有route层的输出
+        layer_outputs = []      # 所有层的输出
         output = []             # 三个yolo层的输出
 
         # zip的是配置文件和占位的模型层（注：cfg文件有108个block，除去第一个net超参数外，剩下的107个在self.module_defs中，和 self.module_list一一对应可以zip）
