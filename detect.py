@@ -52,12 +52,12 @@ def detect(save_txt=False, save_img=False):
         dataset = LoadStreams(source, img_size=img_size, half=half)
     else:
         save_img = True
-        dataset = LoadImages(source, img_size=img_size, half=half) 
+        dataset = LoadImages(source, img_size=img_size, half=half)  # source是测试的文件夹路径，返回的dataset是一个迭代器
 
     
     # Get classes and colors
     classes = load_classes(parse_data_cfg(opt.data)['names'])                           # .data文件解析成dict并索引类别名的name文件地址
-    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(classes))]  
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(classes))]  # 配置颜色
 
     # Run inference
     t0 = time.time()
@@ -66,13 +66,13 @@ def detect(save_txt=False, save_img=False):
 
         # Get detections
         img = torch.from_numpy(img).to(device)
-        if img.ndimension() == 3:   
+        if img.ndimension() == 3:   # 查看数据维度是否为三维，等价于len(img.shape)
             img = img.unsqueeze(0)  # 加个第0维bs，但是detect实际没用
 
-        # 只用到io的结果，不用p
+        # 只用到io的结果，不用p；io有三个维度：bs(1),num_proposal(每个yolo层预测其特征图的w*h*3个proposal),num_params(5+classes)
         pred, _ = model(img)        # forward 
 
-       
+        # NMS后返回的张量维度：[(num_detections,7),...] (7=(x1, y1, x2, y2, object_conf, class_conf, class))  (len=bs)
         # 遍历时det是每张图片的bbox属性： (num_detections,7)
         for i, det in enumerate(non_max_suppression(pred, opt.conf_thres, opt.nms_thres)):  # detections per image
             if webcam:  # batch_size >= 1
@@ -83,9 +83,9 @@ def detect(save_txt=False, save_img=False):
             save_path = str(Path(out) / Path(p).name)
 
             # s 是最后检测打印的字符串，会通过字符串拼接逐渐添加项
-            s += '%gx%g ' % img.shape[2:]  # 如  320x416 
+            s += '%gx%g ' % img.shape[2:]  # s添加缩放后的图像尺度，如  320x416 
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size  
+                # Rescale boxes from img_size to im0 size  将预测的bbox坐标(前四维)从缩放图放大回原图尺度
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results： 统计各类物体出现的次数
@@ -95,7 +95,6 @@ def detect(save_txt=False, save_img=False):
 
                 # Write results
                 for *xyxy, conf, _, cls in det:
-                    import ipdb; ipdb.set_trace()
                     if save_txt:  # Write to file
                         with open(save_path + '.txt', 'a') as file:
                             file.write(('%g ' * 6 + '\n') % (*xyxy, cls, conf))

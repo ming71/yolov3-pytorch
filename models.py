@@ -14,15 +14,16 @@ def create_modules(module_defs, img_size, arc):
     # 这个参数比较还重要！经过一个层（这里记录的是conv,route,shortcut）后如果输出的通道数会改变，卷积核个数也就是计算的输出通道数会被添加这个list，便于后面配置卷积层参数的输入通道（初始这里设置图像通道数3）
     output_filters = [int(hyperparams['channels'])]     
     module_list = nn.ModuleList()
-    routes = []  # list of layers which route to deeper layes,融合的层
+    routes = []  # list of layers which route to deeper layes,融合的层，残差连接和特征融合层的index都存在这里
     yolo_index = -1
 
     for i, mdef in enumerate(module_defs):
         modules = nn.Sequential()   # 读一个block就放一个Sequential，如果是卷积层就直接conv+bn+relu安排上；如果是route层，则Sequential空着提供站位符的作用
 
+        #卷积层（75个）
         if mdef['type'] == 'convolutional':
             bn = int(mdef['batch_normalize'])   #bn是bool开关，cfg中batch_normalize是1需要加bn层，为0不加（cfg是全加的）
-            filters = int(mdef['filters'])      
+            filters = int(mdef['filters'])      # 卷及核个数和尺寸
             kernel_size = int(mdef['size'])
             pad = (kernel_size - 1) // 2 if int(mdef['pad']) else 0
             modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters[-1],
@@ -30,7 +31,7 @@ def create_modules(module_defs, img_size, arc):
                                                    kernel_size=kernel_size,
                                                    stride=int(mdef['stride']),
                                                    padding=pad,
-                                                   bias=not bn))    
+                                                   bias=not bn))    # 注意有BN就不加bias，二者等效
             if bn:
                 modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
             if mdef['activation'] == 'leaky':   # TODO: activation study https://github.com/ultralytics/yolov3/issues/441
@@ -51,17 +52,21 @@ def create_modules(module_defs, img_size, arc):
         elif mdef['type'] == 'upsample':
             modules = nn.Upsample(scale_factor=int(mdef['stride']), mode='nearest')
 
+        # 特征融合concat层的标识
         # 注意：route和shortcut的层在这里都不处理Sequential()是空的，只是把两者要融合的index放到routes list中去，后面forward再构建连接。
         # route:[1, 5, 8, 12, 15, 18, 21, 24, 27, 30, 33, 37, 40, 43, 46, 49, 52, 55, 58, 62, 65, 68, 71, 79, 85, 61, 91, 97, 36]
         # 共四处route，layer分别是-4,(-1,61),-4,(-1,36)，传入route的参数是79, 85, 61, 91, 97, 36
+        # ！添加到route列表的数字指向该层哪、要融合的那层的index!
         elif mdef['type'] == 'route':  
             layers = [int(x) for x in mdef['layers'].split(',')]
-            filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])      
+            filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])      #卷积核数目为两层的加和:负数就是取之前的层卷积核数为通道；正数要+1取出后面的是输出
             routes.extend([l if l > 0 else l + i for l in layers])
             # if mdef[i+1]['type'] == 'reorg3d':
             #     modules = nn.Upsample(scale_factor=1/float(mdef[i+1]['stride']), mode='nearest')  # reorg3d
 
-        # 共23个残差block，是sum加和的层
+        # shortcut即ResNet的残差连接层
+        # 共23个残差block，是sum加和的层，所以参数全都是-3，结合当前层和倒数第三个的（-1,-2层分别是侧分支3*3和1*1卷积）
+        # ！添加到route列表的数字指向该层哪、要融合的那层的index!
         elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
             filters = output_filters[int(mdef['from'])]     # sum输出通道和输入的相同
             layer = int(mdef['from'])   # shortcut的layer全是-3
@@ -74,15 +79,17 @@ def create_modules(module_defs, img_size, arc):
 
         elif mdef['type'] == 'yolo':
             yolo_index += 1   # 从0开始
-            mask = [int(x) for x in mdef['mask'].split(',')]  # anchor mask，cfg的anchor选择
-            modules = YOLOLayer(anchors=mdef['anchors'][mask],  # anchor list，用mask提取特定的三个anchor尺度，
+            mask = [int(x) for x in mdef['mask'].split(',')]  # anchor mask，cfg的anchor选择,eg.[6, 7, 8]
+            modules = YOLOLayer(anchors=mdef['anchors'][mask],  # anchor list，用mask提取特定的三个anchor尺度，eg.array([[116,90],[156,198],[373,326]])
                                 nc=int(mdef['classes']),  # number of classes,eg.20
                                 img_size=img_size,  # (416, 416)
-                                yolo_index=yolo_index,  # 三层
+                                yolo_index=yolo_index,  # 0, 1 or 2三层
                                 arc=arc)  # yolo architecture
 
             # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
             # 用的是Focal Loss的3.3节提到的解决标签不平衡办法
+            #   -问题：初始阶段很多的负样本anchor，如果等同得初始化分类为-1和1,会导致负样本太多而生成不稳定的loss
+            #   -方法：用一定的系数约束这种不平衡，给正阳本增加先验权重。具体而言，在最后一层卷积（实际是每个YOLOLayer之前的那个1*1压缩为class数目的卷积层）的bias进行特定的初始化
             try:
                 if arc == 'defaultpw' or arc == 'Fdefaultpw':  # default with positive weights
                     b = [-4, -3.6]  # obj, cls
@@ -149,7 +156,7 @@ class YOLOLayer(nn.Module):
             ny = int(img_size[0] / stride)  # number y grid points
             create_grids(self, img_size, (nx, ny))  
 
-    def forward(self, p, img_size, var=None):   
+    def forward(self, p, img_size, var=None):   # p是特征图，img_size是缩放并padding后的尺寸如torch.Size([320, 416])（用来确定原图和特征图的对应位置）
         if ONNX_EXPORT:
             bs = 1  # batch size
         else:
@@ -160,8 +167,10 @@ class YOLOLayer(nn.Module):
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.na, self.nc + 5, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
-        # 这里直接用的是nn.Module的属性所以没有定义
+        # self继承自nn.Module，其自带属性self.training且默认为True，但是在model.eval()会被设置成False
+        # 这里直接用的是nn.Module的属性所以没有定义（作者对pytorch用的很熟练）
         if self.training:
+            # 如果是training,直接返回yolo fp (bs, anchors, grid, grid, classes + xywh)
             return p
 
         elif ONNX_EXPORT:
@@ -196,6 +205,7 @@ class YOLOLayer(nn.Module):
             io[..., 0:2] = torch.sigmoid(io[..., 0:2]) + self.grid_xy  # xy ：预测的偏移 + grid cell id
             io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh    # wh yolo method （加exp化为正数）；wh预测的是一个比例，基准是anchor
             # io[..., 2:4] = ((torch.sigmoid(io[..., 2:4]) * 2) ** 3) * self.anchor_wh  # wh power method
+            # 从特征图放大到原图尺寸
             io[..., :4] *= self.stride
 
             if 'default' in self.arc:  # seperate obj and cls
@@ -212,6 +222,9 @@ class YOLOLayer(nn.Module):
                 io[..., 5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
 
             # 注意：yolo层返回两个张量
+            #   - 一个是三个维度的(分类和置信度得分归一化了)         [1, 507, 85]
+            #   - 一个是简爱的输入reshape分分离出不同类别得分而已    [1, 3, 13, 13, 85]
+            # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
             return io.view(bs, -1, 5 + self.nc), p
 
 
@@ -228,13 +241,13 @@ class Darknet(nn.Module):
         self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
         self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
 
-    def forward(self, x, var=None):     
+    def forward(self, x, var=None):     # x是传入的缩放和padding后的像素矩阵
 
         img_size = x.shape[-2:] # 取出hw
         layer_outputs = []      # 所有route层的输出
         output = []             # 三个yolo层的输出
 
-      
+        # zip的是配置文件和占位的模型层（注：cfg文件有108个block，除去第一个net超参数外，剩下的107个在self.module_defs中，和 self.module_list一一对应可以zip）
         for i, (mdef, module) in enumerate(zip(self.module_defs, self.module_list)):
             mtype = mdef['type']
             if mtype in ['convolutional', 'upsample', 'maxpool']:
@@ -253,19 +266,22 @@ class Darknet(nn.Module):
             elif mtype == 'shortcut':
                 x = x + layer_outputs[int(mdef['from'])]    # 残差连接，加和其上一层-1（当前层不是-1执行最后才append）和往上数第三层(-3)
             elif mtype == 'yolo':
+                # 注意：yolo层return的有两个张量,x是一个包含两种张量的tuple
                 x = module(x, img_size) 
                 output.append(x)                                    # 添加三个yolo层的输出
             layer_outputs.append(x if i in self.routes else [])     # 添加所有route层的输出
 
         if self.training:
+            # 注意训练阶段时,返回的是三张yolo层的特征图
             return output
         elif ONNX_EXPORT:
             output = torch.cat(output, 1)  # cat 3 layers 85 x (507, 2028, 8112) to 85 x 10647
             nc = self.module_list[self.yolo_layers[0]].nc  # number of classes
             return output[5:5 + nc].t(), output[:4].t()  # ONNX scores, boxes
         else:
+            # 每个yolo层输出一个2张量的tuple，三个yolo最后的output为[(a1,a2)),(b1,b2),(c1,c2)]的形式，unzip后为[(a1,b1,c1),(a2,b2,c2)]
+            # [(a1,b1,c1),(a2,b2,c2)]分别是io和p;前者是3维度，后者5维度
             io, p = list(zip(*output))  # inference output, training output
-            import ipdb; ipdb.set_trace()
             return torch.cat(io, 1), p  # 保留bs(1)和数据(5+classes)维度,将中间的proposal进行concat(每个yolo层预测其特征图的w*h*3个proposal)
 
     def fuse(self):
@@ -289,7 +305,9 @@ def get_yolo_layers(model):
     return [i for i, x in enumerate(model.module_defs) if x['type'] == 'yolo']  # [82, 94, 106] for yolov3
 
 
-  
+# 做了两件事：
+    # - 编码grid cell的坐标
+    # - 将anchor缩放到特征图尺度（后面在特征图上进行预测）
 def create_grids(self, img_size=416, ng=(13, 13), device='cpu', type=torch.float32):
     nx, ny = ng  # x and y grid size # ng是传入的特征图宽高tuple
     # 计算降采样步长self.stride 32/16/8
@@ -298,6 +316,8 @@ def create_grids(self, img_size=416, ng=(13, 13), device='cpu', type=torch.float
 
     # build xy offsets
     # 最终结果self.grid_xy的维度为torch.Size([1, 1, 10, 13, 2])，其中10和13的维度对应的是特征图的每个点，最后的2是其上的编号
+    # 如特征图为10*13,则构建的偏移阵列从[0,0]，[1,0]...[12,0],   [0,1].[1,1]...[12,1], ...[12,9]
+    # 表示的是特征图每个像素点的位置，也就是原图的grid左上角坐标，和后面预测的cell内偏移共同表示最终预测的物体位置
     yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
     self.grid_xy = torch.stack((xv, yv), 2).to(device).type(type).view((1, 1, ny, nx, 2))
 
